@@ -1,0 +1,51 @@
+# Celestial 設定ファイル(すべて省略可。書いていない項目は既定値)
+# 画面の「モデルと設定」で変えた設定は、このファイルより優先されます。
+
+# 学習データ(SQLite)の保存先。既定は ~/.celestial
+# home = "C:/Users/you/.celestial"
+
+# バックエンド: type で実装を切り替える。自作AIは type を追加して差し替える。
+[backends.ollama]
+type = "ollama"
+host = "http://127.0.0.1:11434"
+
+# モデルを明示したい場合のみ書く。省略時は各バックエンドから自動検出。
+# [[models]]
+# name = "qwen2.5-coder:7b"
+# backend = "ollama"
+# tier = "medium"        # small / medium / large
+
+[manager]
+model = "auto"            # auto = 検出された中で最小のモデル
+auto_title = true         # 最初のやり取りのあと、会話に内容を表す短い題名を AI で付ける
+
+[evolve]
+cache = true              # 同じタスクは再計算しない
+learned_routing = true    # 管理AIの振り分けを学習し、LLM呼び出しを省く
+route_confidence = 0.85   # 学習済みルーターを信頼する閾値
+fewshot_k = 2             # 過去の成功例を何件まで手本として渡すか
+fewshot_min_sim = 0.35
+explore = 0.3             # モデル選択の探索の強さ(UCB)
+semantic_search = true    # 埋め込みモデルがあれば、手本を意味の近さで探す
+embed_model = "auto"      # auto = 最初に見つかった埋め込みモデル / off = 使わない
+cascade = true            # 自信のない回答や言語の取り違えは、より正確なAIで答え直す
+
+[tools]
+workspace = ""            # 道具がファイルを扱える作業フォルダ(空ならファイルの道具は使わない)
+write = false             # 作業フォルダ内のファイルの作成・編集・移動・削除を許可(バックアップあり)
+run = false               # コマンドと、AIが書いた Python コードの実行を許可
+pc = false                # PC の操作(アプリを開く・入力・クリック・画面を見る)を許可
+net = false               # ネットの利用(Wikipedia・指定ページ・事実の裏付け)を許可
+confirm = true            # 影響のある操作の前に、内容を見せて確認する
+max_steps = 20            # エージェントが1つの依頼で使える手数の上限
+
+[remote]
+enabled = true            # Tailscale 経由で、登録したスマホからの接続を受け付ける
+control = true            # 登録したスマホから、この PC の画面を見たり操作したりできる
+keep_running = false      # ウィンドウを閉じても動き続ける(スマホから使い続けるため)
+
+[swarm]
+auto = true               # 複合タスクを自動でサブタスクに分解する
+min_chars = 80            # これより短いタスクは分解しない
+max_subtasks = 4
+parallel = 2

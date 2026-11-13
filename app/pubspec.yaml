@@ -1,0 +1,24 @@
+name: celestial
+description: "Celestial: 小型AI群と管理AIによる、使うほど進化するローカルAI(スマホ・PC 用アプリ)"
+publish_to: 'none'
+version: 0.2.0+2
+
+environment:
+  sdk: ^3.13.3
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_localizations:
+    sdk: flutter
+  path_provider: ^2.1.5
+  celestial_llm:
+    path: packages/celestial_llm
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true

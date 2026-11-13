@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+.venv/
+dist/
+*.egg-info/
+.celestial/
+
+# Flutter のゴールデンテストが失敗したときの差分画像(生成物)
+app/test/failures/

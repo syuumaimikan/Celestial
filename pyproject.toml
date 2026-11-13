@@ -1,0 +1,20 @@
+[project]
+name = "celestial"
+version = "0.1.0"
+description = "小型AI群と管理AIによる、使うほど進化するローカルAIオーケストレーター"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+# 自作AIの学習と利用に必要。torch は GPU 用の配布元から入れること(README 参照)
+train = ["torch", "transformers", "peft", "gguf"]
+
+[project.scripts]
+celestial = "celestial.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/celestial"]

@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Celestial</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%231b2a5e'/%3E%3Cpath d='M8 21 15 10l9 5-6 8z' fill='none' stroke='%238fa8ff' stroke-width='1.5'/%3E%3Ccircle cx='8' cy='21' r='2.2' fill='%23fff'/%3E%3Ccircle cx='15' cy='10' r='2.8' fill='%23f0c25a'/%3E%3Ccircle cx='24' cy='15' r='2.2' fill='%23fff'/%3E%3Ccircle cx='18' cy='23' r='2.2' fill='%23fff'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<div class="shell">
+  <aside class="side">
+    <div class="brand">
+      <svg viewBox="0 0 32 32" width="28" height="28" aria-hidden="true"><path d="M6 22 14 8l11 6-7 11z" fill="none" stroke="currentColor" stroke-width="1.4" opacity=".55"/><circle cx="6" cy="22" r="2.4" fill="currentColor"/><circle cx="14" cy="8" r="3.2" class="star"/><circle cx="25" cy="14" r="2.4" fill="currentColor"/><circle cx="18" cy="25" r="2.4" fill="currentColor"/></svg>
+      <span>Celestial</span>
+    </div>
+    <nav id="nav" aria-label="メイン">
+      <button data-view="chat" class="on"><svg viewBox="0 0 20 20"><path d="M3 5.5A2.5 2.5 0 0 1 5.5 3h9A2.5 2.5 0 0 1 17 5.5v6a2.5 2.5 0 0 1-2.5 2.5H9l-4 3v-3.2A2.5 2.5 0 0 1 3 11.5z"/></svg><span>会話</span></button>
+      <button data-view="flows"><svg viewBox="0 0 20 20"><rect x="2.5" y="3" width="5" height="4" rx="1"/><rect x="12.5" y="8" width="5" height="4" rx="1"/><rect x="2.5" y="13" width="5" height="4" rx="1"/><path d="M7.5 5h2.5v10H7.5M10 10h2.5"/></svg><span>自動化</span></button>
+      <button data-view="decide"><svg viewBox="0 0 20 20"><path d="M10 3v14M5.5 17h9M4 7h12M4 7l-2 5h4zM16 7l-2 5h4z"/></svg><span>判断</span></button>
+      <button data-view="phone"><svg viewBox="0 0 20 20"><rect x="6" y="2.5" width="8" height="15" rx="2"/><path d="M9 15h2"/></svg><span>スマホ連携</span></button>
+      <button data-view="learn"><svg viewBox="0 0 20 20"><path d="M3 16h14M5 13l3.5-4 3 2.5L16 5"/><path d="M12.5 5H16v3.5"/></svg><span>学習状況</span></button>
+      <button data-view="bench"><svg viewBox="0 0 20 20"><circle cx="10" cy="10" r="7"/><circle cx="10" cy="10" r="3.2"/><path d="M10 1.5v3M10 15.5v3M1.5 10h3M15.5 10h3"/></svg><span>精度の計測</span></button>
+      <button data-view="settings"><svg viewBox="0 0 20 20"><path d="M3 6h8M15 6h2M3 14h2M9 14h8"/><circle cx="13" cy="6" r="2"/><circle cx="7" cy="14" r="2"/></svg><span>モデルと設定</span></button>
+    </nav>
+    <div class="side-foot">
+      <div id="link-status" class="status"><i></i><span>スマホ連携: 確認中</span></div>
+      <div id="status" class="status"><i></i><span>接続を確認中…</span></div>
+      <button id="theme" class="ghost" type="button">表示: 自動</button>
+    </div>
+  </aside>
+
+  <main>
+    <!-- 会話 -->
+    <section id="view-chat" class="view chat-view">
+      <div class="threads">
+        <div class="threads-head">
+          <button type="button" class="primary wide" id="new-chat">新しい会話</button>
+          <input type="search" id="thread-search" placeholder="会話を検索" aria-label="会話を検索">
+        </div>
+        <div id="thread-list" class="thread-list" role="list"></div>
+      </div>
+      <div class="chat">
+        <header class="chat-head">
+          <div class="chat-title"><b id="chat-title">新しい会話</b><span id="chat-sub" class="note"></span></div>
+          <div class="chat-actions" id="chat-actions"></div>
+        </header>
+        <div id="global-approvals" class="global-approvals"></div>
+        <div id="messages" class="messages" aria-live="polite"></div>
+        <form id="composer" class="composer" autocomplete="off">
+          <div id="attachments" class="attachments" hidden></div>
+          <textarea id="task" rows="1" placeholder="メッセージを入力(Enter で送信、Shift+Enter で改行、画像や文書のファイルは貼り付けかドラッグでも添付できます)" aria-label="メッセージ"></textarea>
+          <div class="composer-row">
+            <button type="button" class="icon-btn" id="attach" title="画像・ファイルを添付(貼り付け・ドロップも可)" aria-label="画像・ファイルを添付"><svg viewBox="0 0 20 20"><path d="M14.5 9.5 9 15a3.5 3.5 0 0 1-5-5l6-6a2.3 2.3 0 0 1 3.3 3.3l-6 6a1.1 1.1 0 0 1-1.6-1.6L11 6.5"/></svg></button>
+            <input type="file" id="file-input" accept="image/*,text/*,.md,.csv,.tsv,.json,.jsonl,.py,.js,.ts,.tsx,.jsx,.html,.css,.log,.xml,.yaml,.yml,.toml,.ini,.c,.cpp,.h,.hpp,.cs,.java,.kt,.go,.rs,.rb,.php,.sql,.sh,.ps1,.bat,.dart,.swift,.tex" multiple hidden>
+            <label class="pick">担当
+              <select id="opt-role" aria-label="担当"><option value="">自動</option></select>
+            </label>
+            <label class="pick">流れ
+              <select id="opt-context" aria-label="会話の流れ">
+                <option value="auto">自動</option><option value="on">常に使う</option><option value="off">使わない</option>
+              </select>
+            </label>
+            <button type="button" class="chip" id="opt-agent" aria-pressed="false" title="AIエージェントとして動かします。設定で許可した道具(ファイル・コマンド・PC操作・ネット)を使い、自分で段取りして目標まで進めます。「〜アプリを作って」と頼むと、プロジェクトを作って確かめます">エージェント</button>
+            <label class="pick folder-pick" id="opt-folder-pick" hidden title="エージェントが作業するフォルダ。この中のファイルを読み書きします">フォルダ
+              <select id="opt-folder" aria-label="作業するフォルダ"></select>
+            </label>
+            <button type="button" class="chip" id="opt-verify" aria-pressed="false" title="管理AIが回答を検証し、問題があれば再回答させます。精度は上がりますが遅くなります">検証する</button>
+            <button type="button" class="chip" id="opt-swarm" aria-pressed="false" title="タスクを分解し、複数のAIで分担します">分担する</button>
+            <span class="grow"></span>
+            <button type="submit" class="primary" id="send">送信</button>
+          </div>
+        </form>
+      </div>
+    </section>
+
+    <!-- 自動化 -->
+    <section id="view-flows" class="view page" hidden>
+      <header class="page-head"><h1>自動化</h1><p>きっかけ(手動・時刻・間隔・Webhook・ファイルの追加)と手順(AI・ウェブ・ファイル・文書・コマンド・通知・条件)をつないで、仕事を自動で動かします。</p></header>
+      <div id="flows-body"></div>
+    </section>
+
+    <!-- 判断 -->
+    <section id="view-decide" class="view page" hidden>
+      <header class="page-head"><h1>判断</h1><p>文章を作らずに、決まった選択肢から1つを確率つきで選びます(Jev のような System 1)。自動化の分岐や、覚えるべき発言の見分けにも使っています。</p></header>
+      <div id="decide-body"></div>
+    </section>
+
+    <!-- スマホ連携 -->
+    <section id="view-phone" class="view page" hidden>
+      <header class="page-head"><h1>スマホ連携</h1><p>Tailscale 経由で、スマホからこの PC の AI を使ったり、会話を同期したり、PC を操作したりできます。</p></header>
+      <div id="phone-body"></div>
+    </section>
+
+    <!-- 学習状況 -->
+    <section id="view-learn" class="view page" hidden>
+      <header class="page-head"><h1>学習状況</h1><p>使うほど速く、少ない計算で答えられるようになっているかを確かめます。</p></header>
+      <div id="learn-body"></div>
+    </section>
+
+    <!-- 計測 -->
+    <section id="view-bench" class="view page" hidden>
+      <header class="page-head"><h1>精度の計測</h1><p>答えの決まった課題を解かせて自動採点します。計測は学習状態を変えません。</p></header>
+      <div class="panel bench-controls">
+        <label class="pick">対象
+          <select id="bench-model" aria-label="計測の対象"><option value="">自動(管理AIが選ぶ)</option></select>
+        </label>
+        <label class="check"><input type="checkbox" id="bench-code"> コードの課題も採点する</label>
+        <label class="check"><input type="checkbox" id="bench-verify"> 検証つき</label>
+        <span class="grow"></span>
+        <button class="primary" id="bench-start" type="button">計測を始める</button>
+        <p class="note" id="bench-code-note" hidden>コードの採点では、AIが書いた Python コードをこのPC上で実行します。</p>
+      </div>
+      <div id="bench-progress"></div>
+      <div id="bench-history"></div>
+    </section>
+
+    <!-- 設定 -->
+    <section id="view-settings" class="view page" hidden>
+      <header class="page-head"><h1>モデルと設定</h1><p>利用できるAIと、学習のしかたを確認・変更します。</p></header>
+      <div id="settings-body"></div>
+    </section>
+  </main>
+</div>
+<div id="toast" class="toast" role="status" hidden></div>
+<script src="app.js"></script>
+<script src="flows.js"></script>
+<script src="decide.js"></script>
+</body>
+</html>

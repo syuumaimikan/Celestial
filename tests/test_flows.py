@@ -221,6 +221,64 @@ class ServerFlowTest(unittest.TestCase):
         self.assertEqual((run["status"], run["source"]), ("done", "phone"))
         self.assertEqual(self.status(self.remote + f"/api/flows/{flow['id']}/delete", {}, auth), 403)
 
+    def test_new_step_types_json_vars_numeric_ops_and_templates(self):
+        # /api/flows が templates を返し、新ステップ種別 (kb_search, for_each, document append) と JSON 変数が動くこと
+        listing = self.call(self.base + "/api/flows")
+        self.assertGreaterEqual(len(listing.get("templates") or []), 3)
+
+        self.app.kb.add_note("規程", "承認ラインは10000円以上です。")
+        self.app.set_setting("tools_write", True)
+        flow = self.call(self.base + "/api/flows", {
+            "name": "KBと集計分岐",
+            "trigger": {"type": "manual"},
+            "steps": [
+                {"type": "kb_search", "query": "承認ライン", "top_k": "2"},
+                {"type": "template", "text": '{"amount": 15000, "note": "OK"}'},
+                {"type": "condition", "value": "{{step2}}", "op": "json_has", "match": "amount"},
+                {"type": "condition", "value": "{{step2.amount}}", "op": "gt", "match": "10000"},
+                {"type": "document", "kind": "docx", "path": "flow_log.docx", "mode": "overwrite", "content": "# 記録\n\n初回"},
+                {"type": "document", "kind": "docx", "path": "flow_log.docx", "mode": "append", "content": "\n\n## 追記\n{{step2.note}}"},
+                {"type": "for_each", "items": "行1\n行2", "prompt": "処理: {{item}}"},
+            ],
+        })
+        run_id = self.call(self.base + f"/api/flows/{flow['id']}/run", {})["run_id"]
+        for _ in range(100):
+            run = self.call(self.base + f"/api/flows/runs/{run_id}")
+            if run["status"] != "running":
+                break
+            time.sleep(0.02)
+        self.assertEqual(run["status"], "done")
+        self.assertIn("10000円", run["log"][0]["output"])
+        from celestial import office
+        docx_text = office.read_text(Path(self.app.workspace_root()) / "flow_log.docx")
+        self.assertIn("初回", docx_text)
+        self.assertIn("OK", docx_text)
+
+    def test_web_search_transform_and_tool_steps(self):
+        from unittest import mock
+
+        self.app.set_setting("tools_net", True)
+        flow = self.call(self.base + "/api/flows", {
+            "name": "検索と整形と計算",
+            "trigger": {"type": "manual"},
+            "steps": [
+                {"type": "web_search", "query": "{{trigger}}", "lang": "ja", "limit": "3"},
+                {"type": "transform", "action": "count", "input": "{{prev}}", "arg": ""},
+                {"type": "transform", "action": "json_get", "input": "{{prev}}", "arg": "lines"},
+                {"type": "tool", "name": "calc", "args": "{\"expression\": \"2*x + {{prev}} = 10\"}"},
+            ],
+        })
+        with mock.patch("celestial.web.search", return_value=("1. テスト結果\n   https://example.com", [{"title": "テスト結果"}])):
+            run_id = self.call(self.base + f"/api/flows/{flow['id']}/run", {"input": "テスト"})["run_id"]
+            for _ in range(100):
+                run = self.call(self.base + f"/api/flows/runs/{run_id}")
+                if run["status"] != "running":
+                    break
+                time.sleep(0.02)
+        self.assertEqual(run["status"], "done", run["log"])
+        self.assertEqual(run["log"][2]["output"], "2")
+        self.assertEqual(run["output"], "x = 4")
+
 
 if __name__ == "__main__":
     unittest.main()

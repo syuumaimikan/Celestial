@@ -9,9 +9,9 @@ import 'ui/chat_page.dart';
 import 'ui/common.dart';
 import 'ui/files_page.dart';
 import 'ui/flows_page.dart';
-import 'ui/models_page.dart';
 import 'ui/remote_page.dart';
 import 'ui/settings_page.dart';
+import 'ui/vision_page.dart';
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -108,6 +108,12 @@ class _HomeShellState extends State<HomeShell> {
     });
   }
 
+  /// 「見る」で読み取った文字を、会話の入力欄に入れて会話へ移る。
+  void _toChat(String text) {
+    setState(() => _index = 0);
+    _prefill.value = text;
+  }
+
   @override
   void dispose() {
     _toasts?.cancel();
@@ -128,9 +134,9 @@ class _HomeShellState extends State<HomeShell> {
           ]
         : const [
             _Destination('会話', Icons.forum_outlined, Icons.forum),
+            _Destination('見る', Icons.center_focus_weak_outlined, Icons.center_focus_strong),
             _Destination('PC操作', Icons.desktop_windows_outlined, Icons.desktop_windows),
             _Destination('ファイル', Icons.folder_outlined, Icons.folder),
-            _Destination('AIモデル', Icons.memory_outlined, Icons.memory),
             _Destination('設定', Icons.tune_outlined, Icons.tune),
           ];
     if (_index >= destinations.length) _index = 0;
@@ -138,9 +144,9 @@ class _HomeShellState extends State<HomeShell> {
         ? [ChatPage(prefill: _prefill), const FlowsPage(), const SettingsPage()]
         : [
             ChatPage(prefill: _prefill),
-            RemotePage(active: _index == 1),
-            FilesPage(active: _index == 2),
-            ModelsPage(active: _index == 3),
+            VisionPage(active: _index == 1, onSendToChat: _toChat),
+            RemotePage(active: _index == 2),
+            FilesPage(active: _index == 3),
             const SettingsPage(),
           ];
     final body = IndexedStack(index: _index, children: pages);

@@ -31,13 +31,13 @@ embed_model = "auto"      # auto = 最初に見つかった埋め込みモデル
 cascade = true            # 自信のない回答や言語の取り違えは、より正確なAIで答え直す
 
 [tools]
-workspace = ""            # 道具がファイルを扱える作業フォルダ(空ならファイルの道具は使わない)
+workspace = ""            # 道具がファイルを扱える作業フォルダ(空なら ~/Celestial を使う)
 write = false             # 作業フォルダ内のファイルの作成・編集・移動・削除を許可(バックアップあり)
 run = false               # コマンドと、AIが書いた Python コードの実行を許可
 pc = false                # PC の操作(アプリを開く・入力・クリック・画面を見る)を許可
 net = false               # ネットの利用(Wikipedia・指定ページ・事実の裏付け)を許可
-confirm = true            # 影響のある操作の前に、内容を見せて確認する
-max_steps = 20            # エージェントが1つの依頼で使える手数の上限
+confirm = false           # 影響のある操作の前に確認する(false = すべて自動。危ないコマンドは止め、作業フォルダの外を変えるときなどは確かめる)
+max_steps = 30            # エージェントが1つの依頼で使える手数の上限
 
 [remote]
 enabled = true            # Tailscale 経由で、登録したスマホからの接続を受け付ける

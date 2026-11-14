@@ -51,6 +51,8 @@ class ModelInfo:
     tier_override: str | None = None
     can_manage: bool = True  # 管理AI(振り分け・検証)を任せられるか
     vision: bool = False     # 画像を入力として受け取れるか
+    specialties: tuple[str, ...] = ()  # 得意な役割 ("code", "reason", "translate", "agent", "judge" など)
+    profile: str = ""                  # 自作AIのプロファイル名 ("nano", "coder", "agent" など)
 
     @property
     def tier(self) -> str:

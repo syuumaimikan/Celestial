@@ -47,3 +47,10 @@ kotlin {
 flutter {
     source = "../.."
 }
+
+dependencies {
+    // 「見る」の日本語の文字認識(ML Kit。端末の中で動く。英数字も読める)
+    implementation("com.google.mlkit:text-recognition-japanese:16.0.1")
+    // アプリの更新で、受け取った APK を入れ替えの画面に渡す(FileProvider)
+    implementation("androidx.core:core:1.13.1")
+}

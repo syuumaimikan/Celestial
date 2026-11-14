@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
+import shutil
 import sys
 import time
 from collections import Counter
@@ -10,8 +12,9 @@ from .backends import BackendError
 from .bench import Report, load_tasks, run_bench
 from .config import load_config
 from .manager import Celestial, Result
-from .study import review_study, run_study
-from .train import TrainConfig, TrainError, finish_model, train, training_examples
+from .study import review_study, run_study, weak_roles
+from .train import (MODEL_PRESETS, OWN_PROFILES, TrainConfig, TrainError, config_for_profile, delete_own_model,
+                    evolve_own_ai, finish_model, resolve_base, train, training_examples)
 from .workers import ROLES
 
 
@@ -155,7 +158,56 @@ def _print_report(report: Report) -> None:
         print(f"  ※コード実行が必要な {report.skipped} 件は対象外です(--run-code で採点)")
 
 
+def cmd_agent_bench(app: Celestial, args) -> int:
+    from .agentbench import run_agent_bench
+
+    targets = [m.name for m in sorted(app.models(), key=lambda m: m.size_bytes) if m.can_manage] if args.all_models else [args.model]
+    only = [x.strip() for x in args.only.split(",")] if args.only else None
+    reports = []
+    for target in targets:
+        print(f"\n=== エージェント: {target or '自動(計測で選ぶ)'}")
+
+        def progress(o, i, total):
+            mark = "o" if o.ok else "x"
+            print(f"  {mark} [{i:2}/{total}] {o.id:14} {o.model:22} {o.latency_s:6.1f}s  {o.steps:2} 手  {o.error[:60]}", flush=True)
+
+        reports.append(run_agent_bench(app, model=target, only=only, save=not args.no_save, on_outcome=progress))
+    print()
+    for r in reports:
+        print(f"[agent:{r.model}]  成功 {r.correct}/{r.n} ({r.accuracy:.0%})  平均 {r.avg_latency:.1f}s")
+    if not args.no_save:
+        print(f"\nエージェントのAIの自動選択: {app._pick_agent_model('code').name}")
+    return 0
+
+
+def cmd_publish_app(app: Celestial, args) -> int:
+    """作ったスマホのアプリを、PC から配れる場所に置く(スマホのアプリの「更新する」と「スマホ連携」のページから受け取れる)。"""
+    from pathlib import Path
+
+    project = Path(__file__).resolve().parents[2] / "app"
+    source = Path(args.apk) if args.apk else project / "build" / "app" / "outputs" / "flutter-apk" / "app-arm64-v8a-release.apk"
+    pubspec = project / "pubspec.yaml"
+    if not source.is_file():
+        raise ValueError(f"APK がありません: {source}(先に app で flutter build apk --release --split-per-abi "
+                         "--target-platform android-arm64 を実行してください)")
+    found = re.search(r"^version:\s*([\w.\-]+)\+(\d+)", pubspec.read_text("utf-8"), re.M) if pubspec.is_file() else None
+    if not found:
+        raise ValueError("app/pubspec.yaml に版(version: 0.3.0+3 の形)がありません")
+    if not args.apk and pubspec.stat().st_mtime > source.stat().st_mtime:
+        raise ValueError("pubspec.yaml が APK より新しいため、版が合わない可能性があります。APK を作り直してから置いてください")
+    folder = app.cfg.home / "app"
+    folder.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, folder / "celestial.apk")
+    meta = {"version": found.group(1), "build": int(found.group(2)), "size": source.stat().st_size, "published": time.time()}
+    (folder / "celestial.json").write_text(json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8")
+    print(f"スマホのアプリ {meta['version']}(build {meta['build']}、{meta['size'] / 1e6:.1f}MB)を置きました: {folder / 'celestial.apk'}")
+    print("スマホのアプリの「設定 → このアプリについて → 更新する」で入れ替えられます。")
+    return 0
+
+
 def cmd_bench(app: Celestial, args) -> int:
+    if args.agent:
+        return cmd_agent_bench(app, args)
     if args.history:
         rows = app.store.bench_history()
         if not rows:
@@ -202,24 +254,38 @@ def _progress_line(done: int, total: int, message: str) -> None:
 def cmd_study(app: Celestial, args) -> int:
     if args.review:
         r = review_study(app, teacher=args.teacher, on_progress=_progress_line)
-        print(f"\n{r['checked']} 件を見直し、依頼文だけでは答えられない {r['removed']} 件を取り除きました。")
+        print(f"\n{r['checked']} 件を見直し、不要な {r['removed']} 件を削除・{r['cleaned']} 件を整形/検証しました。")
         print(f"学習に使えるデータは合計 {len(training_examples(app.store))} 件です。")
         return 0
-    result = run_study(app, per_role=args.per_role, teacher=args.teacher, roles=[args.role] if args.role else None,
-                       on_progress=_progress_line)
-    print(f"\n教師 {result['teacher']} で {result['added']} 件の練習問題を解いて保存しました。")
+    roles = [args.role] if args.role else (weak_roles(app)[:4] if args.focus_weak else None)
+    result = run_study(
+        app, per_role=args.per_role, teacher=args.teacher, roles=roles,
+        synthetic=args.synthetic, wiki=args.wiki, verify_llm=args.verify, contrastive=args.contrastive,
+        on_progress=_progress_line,
+    )
+    print(f"\n教師 {', '.join(result.get('teachers') or [result['teacher']])} で {result['added']} 件"
+          f"(+プログラム生成 {result['synthetic_added']} 件 / Wikipedia {result.get('wiki_added', 0)} 件 / 選好ペア {result['preferences_added']} 件)を保存しました。")
     print("  " + "  ".join(f"{role} {n}" for role, n in result["by_role"].items()))
     print(f"学習に使えるデータは合計 {len(training_examples(app.store))} 件です。")
     return 0
 
 
 def cmd_train(app: Celestial, args) -> int:
-    config = TrainConfig(base=args.base, epochs=args.epochs, lr=args.lr, batch_tokens=args.batch_tokens, rank=args.rank)
+    base = resolve_base(args.preset or args.base) if (args.preset or args.base) else None
+    roles = [r.strip() for r in args.roles.split(",") if r.strip()] if args.roles else None
+    config = config_for_profile(
+        args.profile,
+        base=base, epochs=args.epochs, lr=args.lr, batch_tokens=args.batch_tokens, grad_accum=args.grad_accum,
+        rank=args.rank, kl_beta=args.kl_beta, neftune_alpha=args.neftune,
+        loraplus_ratio=args.loraplus, offload_optimizer=True if args.offload else None,
+        from_adapter=args.from_adapter, roles=roles, name=args.name, quantize=args.quantize,
+    )
     meta = train(app, config, on_progress=_progress_line)
     eval_text = "" if meta["eval_loss"] is None else f"  検証損失 {meta['base_eval_loss']} → {meta['eval_loss']}"
-    print(f"\n{meta['name']} を作成しました: {meta['examples']} 件で学習、{meta['seconds']} 秒{eval_text}")
+    print(f"\n{meta['name']} を作成しました: 基礎={meta['base']}, {meta['examples']} 件で学習、{meta['seconds']} 秒{eval_text}")
     if not args.no_bench:
-        done = finish_model(app, meta["name"], export=not args.no_export, run_code=args.run_code, on_progress=_progress_line)
+        done = finish_model(app, meta["name"], export=not args.no_export, run_code=args.run_code,
+                            quantize=config.quantize, on_progress=_progress_line)
         print()
         if done["export_error"]:
             print(f"Ollama への書き出しはできませんでした({done['export_error']})。このまま内蔵の実行環境で使います。")
@@ -227,6 +293,80 @@ def cmd_train(app: Celestial, args) -> int:
             _print_report(done["base_report"])
         _print_report(done["report"])
     return 0
+
+
+def cmd_evolve(app: Celestial, args) -> int:
+    base = resolve_base(args.base or args.preset) if (args.base or args.preset) else (None if args.profile else resolve_base("auto"))
+    config = config_for_profile(
+        args.profile,
+        base=base, epochs=args.epochs, quantize=args.quantize, name=args.name,
+        loraplus_ratio=args.loraplus, offload_optimizer=True if args.offload else None,
+    )
+    res = evolve_own_ai(
+        app, config=config, profile=args.profile, study_per_role=args.study_per_role,
+        synthetic=args.synthetic, wiki=args.wiki,
+        review=not args.no_review, run_code=not args.no_code, on_progress=_progress_line,
+    )
+    print(f"\n進化完了: {res['model']} (基礎={res['base']}, 重点役割={', '.join(res['focus_roles'])})")
+    if res["base_correct"] is not None:
+        print(f"  基礎モデル: {res['base_correct']}/{res['base_n']} ({res['base_correct']/max(1, res['base_n']):.0%})")
+    print(f"  自作AI:     {res['bench_correct']}/{res['bench_n']} ({res['bench_correct']/max(1, res['bench_n']):.0%})")
+    return 0
+
+
+def cmd_own_delete(app: Celestial, args) -> int:
+    res = delete_own_model(app, args.name)
+    print(f"削除しました: {res['deleted']}" + (f" (Ollama: {res['ollama']})" if res.get("ollama") else ""))
+    return 0
+
+
+def cmd_kb(app: Celestial, args) -> int:
+    sub = args.kb_cmd
+    if sub == "list":
+        st = app.kb.stats()
+        print(f"知識ベース: {st['docs']} 件の資料 / {st['chunks']} チャンク / 埋め込み済み {st['embedded']} 件")
+        for d in app.kb.list_docs():
+            print(f"  #{d['id']} [{d['kind']}] {d['title']} ({d['chunks']} chunks)  {d['source']}")
+        return 0
+    if sub == "add":
+        if args.note:
+            title = args.title or "メモ"
+            res = app.kb.add_note(title, args.target, tags=args.tags or "")
+            print(f"登録しました: #{res['id']} {res['title']} ({res['chunks']} チャンク)")
+        elif args.url or args.target.startswith(("http://", "https://")):
+            res = app.kb.add_url(args.target, title=args.title or "", tags=args.tags or "")
+            print(f"URL を登録しました: #{res['id']} {res['title']} ({res['chunks']} チャンク)")
+        elif args.folder:
+            res = app.kb.add_folder(args.target, tags=args.tags or "", limit=args.limit)
+            print(f"フォルダを取り込みました: {res['indexed']} ファイル登録 (スキップ {res['skipped']} 件)")
+        else:
+            from pathlib import Path
+            p = Path(args.target).expanduser()
+            if p.is_dir():
+                res = app.kb.add_folder(p, tags=args.tags or "", limit=args.limit)
+                print(f"フォルダを取り込みました: {res['indexed']} ファイル登録 (スキップ {res['skipped']} 件)")
+            else:
+                res = app.kb.add_file(p, tags=args.tags or "")
+                print(f"ファイルを登録しました: #{res['id']} {res['title']} ({res['chunks']} チャンク)")
+        return 0
+    if sub == "search":
+        hits = app.kb.search(args.query, top_k=args.top_k)
+        if not hits:
+            print("該当する資料は見つかりませんでした。")
+            return 0
+        for h_item in hits:
+            print(f"[{h_item['score']:.2f}] {h_item['title']} ({h_item['source']}):\n  {h_item['text'][:240]}\n")
+        return 0
+    if sub == "rm":
+        try:
+            key: int | str = int(args.target)
+        except ValueError:
+            key = args.target
+        if not app.kb.remove(key):
+            raise KeyError(f"資料が見つかりません: {args.target}")
+        print(f"削除しました: {args.target}")
+        return 0
+    raise ValueError(f"不明なサブコマンドです: {sub}")
 
 
 def cmd_ui(app: Celestial, args) -> int:
@@ -296,25 +436,87 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--no-save", action="store_true", help="履歴に残さない")
     p.add_argument("--json", help="回答を含む詳細をJSONで書き出す")
     p.add_argument("--history", action="store_true", help="これまでの計測結果を表示する")
+    p.add_argument("--agent", action="store_true", help="エージェントの作業(ファイル・フォルダ・コマンド)を計測する")
+    p.add_argument("--only", help="--agent で、この課題だけを計測する(カンマ区切りの ID)")
     p.set_defaults(func=cmd_bench)
 
     p = sub.add_parser("study", help="自習: 教師役のAIに練習問題を作らせて解かせ、学習データを貯める")
     p.add_argument("--per-role", type=int, default=15, help="担当ごとの問題数")
     p.add_argument("--role", choices=list(ROLES), help="この担当だけ自習する")
-    p.add_argument("--teacher", help="教師役のモデル(省略時は計測で最も正確なモデル)")
-    p.add_argument("--review", action="store_true", help="保存済みの自習データを見直し、答えられない問題を取り除く")
+    p.add_argument("--teacher", help="教師役のモデル(省略時は役割ごとに計測で最も正確なモデル)")
+    p.add_argument("--review", action="store_true", help="保存済みの自習データを見直し、不良・非自己完結を取り除き整形する")
+    p.add_argument("--focus-weak", action="store_true", help="自作AIの苦手分野(直近計測の正答率が低い役割)を重点的に自習する")
+    p.add_argument("--synthetic", type=int, default=0, help="検算済みのプログラム生成問題(推論・抽出・翻訳・要約)を追加する件数")
+    p.add_argument("--wiki", type=int, default=0, help="Wikipedia 根拠の一般知識 Q&A を追加する件数")
+    p.add_argument("--verify", action="store_true", help="教師AIを使った計算式・単体テストによる自動検算を有効にする")
+    p.add_argument("--contrastive", action="store_true", help="既存自作AIと教師を比較して DPO 選好ペアを収集する")
     p.set_defaults(func=cmd_study)
 
     p = sub.add_parser("train", help="自作AIを学習する(履歴の良い回答 + 自習の成果)")
-    p.add_argument("--base", default=TrainConfig.base, help="基礎モデル(Hugging Face の名前)")
-    p.add_argument("--epochs", type=int, default=TrainConfig.epochs)
-    p.add_argument("--lr", type=float, default=TrainConfig.lr)
+    p.add_argument("--profile", choices=list(OWN_PROFILES.keys()), help="自作AIの種類プロファイル(nano/qwen3-nano/fast/qwen3/pro/coder/reason/lingual/agent/judge)")
+    p.add_argument("--preset", choices=["auto", *MODEL_PRESETS.keys()], help="モデル構成プリセット(auto は VRAM から自動選択)")
+    p.add_argument("--base", default=None, help="基礎モデル(Hugging Face の名前)")
+    p.add_argument("--epochs", type=int, default=None)
+    p.add_argument("--lr", type=float, default=None)
     p.add_argument("--batch-tokens", type=int, default=TrainConfig.batch_tokens, help="1バッチの最大トークン数(GPU メモリに合わせて下げる)")
+    p.add_argument("--grad-accum", type=int, default=TrainConfig.grad_accum, help="勾配累積ステップ数")
     p.add_argument("--rank", type=int, default=TrainConfig.rank, help="LoRA のランク")
+    p.add_argument("--kl-beta", type=float, default=None, help="基礎モデルとの KL 正則化係数(0 で無効)")
+    p.add_argument("--neftune", type=float, default=TrainConfig.neftune_alpha, help="NEFTune 埋め込みノイズ係数")
+    p.add_argument("--loraplus", type=float, default=TrainConfig.loraplus_ratio, help="LoRA+ 学習率倍率(lora_B / lora_A)")
+    p.add_argument("--offload", action="store_true", help="最適化状態を CPU に逃がして GPU メモリを節約する")
+    p.add_argument("--from-adapter", help="継続学習元にする既存自作AI名(例: celestial-v1)")
+    p.add_argument("--roles", help="学習対象の役割をカンマ区切りで指定")
+    p.add_argument("--name", help="作成する自作AI名(省略時はプロファイル名または celestial-vN)")
+    p.add_argument("--quantize", default=None, choices=["q8_0", "q4_k_m", "f16"], help="Ollama 書き出し量子化")
     p.add_argument("--no-bench", action="store_true", help="学習後の書き出しと計測を省く")
     p.add_argument("--no-export", action="store_true", help="Ollama へ書き出さず、内蔵の実行環境で使う")
     p.add_argument("--run-code", action="store_true", help="学習後の計測でコードの課題も採点する")
     p.set_defaults(func=cmd_train)
+
+    p = sub.add_parser("evolve", help="診断 → 見直し → 重点自習 → 学習 → 書き出し・計測を一気に行う")
+    p.add_argument("--profile", choices=list(OWN_PROFILES.keys()), help="作成する自作AIプロファイル(pro/coder/reason/lingual/agent/judge 等)")
+    p.add_argument("--preset", default=None, choices=["auto", *MODEL_PRESETS.keys()], help="基礎モデルプリセット")
+    p.add_argument("--base", help="基礎モデルを直接指定する場合に指定")
+    p.add_argument("--name", help="出力モデル名を上書きする場合に指定")
+    p.add_argument("--study-per-role", type=int, default=8, help="重点役割ごとの追加問題数(0 で追加自習なし)")
+    p.add_argument("--synthetic", type=int, default=40, help="プログラム生成の検算済み問題数")
+    p.add_argument("--wiki", type=int, default=24, help="Wikipedia 根拠の一般知識 Q&A 問題数")
+    p.add_argument("--epochs", type=int, default=None)
+    p.add_argument("--quantize", default=None, choices=["q8_0", "q4_k_m", "f16"])
+    p.add_argument("--loraplus", type=float, default=TrainConfig.loraplus_ratio, help="LoRA+ 学習率倍率")
+    p.add_argument("--offload", action="store_true", help="最適化状態を CPU にオフロード")
+    p.add_argument("--no-review", action="store_true", help="既存自習データの見直しを省く")
+    p.add_argument("--no-code", action="store_true", help="コード実行採点を省く")
+    p.set_defaults(func=cmd_evolve)
+
+    p = sub.add_parser("own-delete", help="作成した自作AIを削除する")
+    p.add_argument("name", help="削除する自作AI名(例: celestial-v1)")
+    p.set_defaults(func=cmd_own_delete)
+
+    kb_p = sub.add_parser("kb", help="ローカル知識ベース(RAG)を管理・検索する")
+    kb_sub = kb_p.add_subparsers(dest="kb_cmd", required=True)
+    kb_sub.add_parser("list", help="登録済みの資料一覧").set_defaults(func=cmd_kb)
+    kb_add = kb_sub.add_parser("add", help="ファイル・フォルダ・URL・メモを登録する")
+    kb_add.add_argument("target", help="パス、URL、または --note 時は本文")
+    kb_add.add_argument("--title", help="タイトル")
+    kb_add.add_argument("--tags", help="タグ")
+    kb_add.add_argument("--note", action="store_true", help="文字列をメモとして登録")
+    kb_add.add_argument("--folder", action="store_true", help="フォルダを一括取り込み")
+    kb_add.add_argument("--url", action="store_true", help="URL を取得して登録")
+    kb_add.add_argument("--limit", type=int, default=80, help="フォルダ取り込み時の最大ファイル数")
+    kb_add.set_defaults(func=cmd_kb)
+    kb_s = kb_sub.add_parser("search", help="知識ベースを検索する")
+    kb_s.add_argument("query", help="検索キーワード・質問")
+    kb_s.add_argument("-k", "--top-k", type=int, default=5, help="返す件数")
+    kb_s.set_defaults(func=cmd_kb)
+    kb_r = kb_sub.add_parser("rm", help="登録した資料を削除する")
+    kb_r.add_argument("target", help="資料 ID またはソース名")
+    kb_r.set_defaults(func=cmd_kb)
+
+    p = sub.add_parser("publish-app", help="作ったスマホのアプリ(APK)を、PC から配れる場所に置く")
+    p.add_argument("--apk", help="置く APK(省略時は app の arm64 向けのリリース版)")
+    p.set_defaults(func=cmd_publish_app)
 
     p = sub.add_parser("export", help="自作モデル学習用のJSONLを書き出す")
     p.add_argument("path")

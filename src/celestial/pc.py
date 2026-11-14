@@ -8,6 +8,7 @@ from __future__ import annotations
 import csv
 import ctypes
 import io
+import json
 import os
 import platform
 import shutil
@@ -557,3 +558,103 @@ def _jpeg(hbitmap, quality: int) -> bytes:
             table = ctypes.cast(stream, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))[0]
             ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(table[2])(stream)  # Release
         gdiplus.GdipDisposeImage(image)
+
+
+# ---- 音声読み上げ・デスクトップ通知・ネットワーク診断 --------------------------
+
+def speak(text: str, *, save_wav: Path | None = None, rate: int = 0) -> str:
+    """Windows の音声合成 (SAPI) で文字を読み上げる。save_wav 指定時は WAV ファイルへ書き出す。"""
+    _require()
+    msg = str(text or "").strip()
+    if not msg:
+        raise PCError("読み上げる内容が空です")
+    rate_val = max(-10, min(10, int(rate)))
+    if save_wav is not None:
+        out = Path(save_wav)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out_literal = str(out).replace("'", "''")
+        ps = (
+            "Add-Type -AssemblyName System.Speech; "
+            "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
+            f"$s.Rate = {rate_val}; "
+            f"$s.SetOutputToWaveFile('{out_literal}'); "
+            "$t = [Console]::In.ReadToEnd(); "
+            "$s.Speak($t); $s.Dispose()"
+        )
+        _powershell(ps, stdin=msg[:8000], timeout=45)
+        if not out.is_file():
+            raise PCError("音声ファイルを作成できませんでした")
+        return f"音声ファイルを作成しました: {out.name} ({out.stat().st_size} B)"
+    ps = (
+        "Add-Type -AssemblyName System.Speech; "
+        "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
+        f"$s.Rate = {rate_val}; "
+        "$t = [Console]::In.ReadToEnd(); "
+        "$s.Speak($t); $s.Dispose()"
+    )
+    _powershell(ps, stdin=msg[:4000], timeout=45)
+    return f"音声で読み上げました ({len(msg)}文字)"
+
+
+def notify_desktop(title: str, text: str) -> str:
+    """Windows の通知バナーを表示する。"""
+    _require()
+    payload = json.dumps({"title": str(title or "Celestial")[:120], "text": str(text or "")[:300]}, ensure_ascii=False)
+    ps = (
+        "Add-Type -AssemblyName System.Windows.Forms; "
+        "Add-Type -AssemblyName System.Drawing; "
+        "$p = [Console]::In.ReadToEnd() | ConvertFrom-Json; "
+        "$n = New-Object System.Windows.Forms.NotifyIcon; "
+        "$n.Icon = [System.Drawing.SystemIcons]::Information; "
+        "$n.BalloonTipTitle = $p.title; $n.BalloonTipText = $p.text; "
+        "$n.Visible = $true; $n.ShowBalloonTip(4000); "
+        "Start-Sleep -Milliseconds 300; $n.Dispose()"
+    )
+    _powershell(ps, stdin=payload, timeout=15)
+    return f"PCに通知を表示しました: {str(title or 'Celestial')[:60]}"
+
+
+def network_info(host: str | None = None, port: int | None = None) -> str:
+    """ローカル IP・待ち受けポート、および任意ホストへの疎通を確認する。"""
+    import socket
+
+    hostname = socket.gethostname()
+    lines = [f"ホスト名: {hostname}"]
+    addrs: list[str] = []
+    try:
+        import psutil
+        for nic, items in psutil.net_if_addrs().items():
+            for it in items:
+                if it.family == socket.AF_INET and not it.address.startswith("127."):
+                    addrs.append(f"{nic}: {it.address}")
+    except Exception:
+        pass
+    if not addrs:
+        try:
+            addrs.append(socket.gethostbyname(hostname))
+        except OSError:
+            pass
+    lines.append("IPv4: " + (", ".join(addrs) if addrs else "不明"))
+    try:
+        import psutil
+        ports = sorted({c.laddr.port for c in psutil.net_connections(kind="inet") if c.status == "LISTEN" and c.laddr})
+        if ports:
+            lines.append("待ち受けポート: " + ", ".join(str(p) for p in ports[:25]))
+    except Exception:
+        pass
+    if host and host.strip():
+        target = host.strip()
+        try:
+            resolved = socket.gethostbyname(target)
+            lines.append(f"名前解決 ({target}): {resolved}")
+        except OSError as e:
+            lines.append(f"名前解決 ({target}): 失敗 ({e})")
+        if port:
+            t0 = time.perf_counter()
+            try:
+                with socket.create_connection((target, int(port)), timeout=4.0):
+                    ms = (time.perf_counter() - t0) * 1000
+                lines.append(f"TCP接続 ({target}:{port}): 成功 ({ms:.1f} ms)")
+            except OSError as e:
+                lines.append(f"TCP接続 ({target}:{port}): 失敗 ({e})")
+    return "\n".join(lines)

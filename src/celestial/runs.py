@@ -15,6 +15,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from typing import Callable
 
+from .agent import is_continuation
 from .backends import BackendError
 from .chats import ChatStore
 from .tools import ToolError
@@ -111,17 +112,20 @@ _REFERENCE = re.compile(r"それ|これ|あれ|上記|前述|さっき|先ほど
                         r"\b(it|that|this|these|those|above|previous)\b", re.I)
 
 
-def needs_context(task: str, has_history: bool) -> bool:
+def needs_context(task: str, has_history: bool, last_reply: str = "") -> bool:
     """会話の流れが必要そうか(必要なければ単独の依頼として扱い、キャッシュや学習済みの振り分けが効くようにする)。
 
     続きの発言を単独と誤る方が害が大きい(話が通じない)ので、迷う場合は流れを使う側に倒す。
+    last_reply は直前の回答。作業が途中で止まった直後の短い発言(「openmeteo を使って」など)は、その作業への指示とみなす。
     """
     if not has_history:
         return False
     text = task.strip()
     if len(text) > 80 and (":" in text or ":" in text or "\n" in text):
         return False  # 処理する本文を自分で含んでいる
-    if len(text) <= 15 or _FOLLOWUP.search(text):
+    if len(text) <= 15 or _FOLLOWUP.search(text) or is_continuation(text):
+        return True
+    if len(text) <= 80 and last_reply.lstrip().startswith("【注意】"):
         return True
     return len(text) <= 60 and bool(_REFERENCE.search(text))
 
@@ -148,13 +152,13 @@ class RunManager:
             conversation = chats.create_conversation(_title(task), origin=who,
                                                      id=conversation_id if conversation is None and conversation_id else None)
         cid = conversation["id"]
-        previous = chats.history_pairs(cid, turns=3)
+        previous = chats.history_pairs(cid, turns=3, keep_first=is_continuation(task))
         user = chats.add_message(cid, "user", task, id=user_message_id, meta={"device": who, "images": len(images or [])})
         assistant = chats.add_message(cid, "assistant", "", meta={"status": "running", "device": "pc",
                                                                    "agent": bool(options.get("agent"))})
         if not conversation["title"]:
             chats.update_conversation(cid, title=_title(task))
-        use_history = context == "on" or (context == "auto" and needs_context(task, bool(previous)))
+        use_history = context == "on" or (context == "auto" and needs_context(task, bool(previous), previous[-1][1] if previous else ""))
         run = Run(uuid.uuid4().hex, cid, user["id"], assistant["id"], who)
         with self._lock:
             self._runs[run.id] = run
@@ -183,7 +187,7 @@ class RunManager:
         if (user.get("meta") or {}).get("images"):
             raise ValueError("画像つきの依頼は、画像を添えてもう一度送ってください")
         options = {"use_cache": False, "verify": True, **(options or {})}
-        previous = chats.history_pairs(cid, before=user["id"], turns=3)
+        previous = chats.history_pairs(cid, before=user["id"], turns=3, keep_first=is_continuation(user["content"]))
         old = target.get("meta") or {}
         # 前の回答への評価・エラー・出典は、作り直した回答には引き継がない
         chats.update_message(message_id, content="", meta={"status": "running", "device": "pc", "agent": bool(options.get("agent") or old.get("agent")),
@@ -192,7 +196,7 @@ class RunManager:
                              touch_conversation=True)
         if old.get("agent"):
             options["agent"] = True
-        use_history = bool(previous) and needs_context(user["content"], True)
+        use_history = bool(previous) and needs_context(user["content"], True, previous[-1][1])
         run = Run(uuid.uuid4().hex, cid, user["id"], message_id, who)
         with self._lock:
             self._runs[run.id] = run
@@ -282,9 +286,11 @@ class RunManager:
         def on_stage(stage: str, info: dict) -> None:
             check()
             run.push({"type": "stage", "stage": stage, **info})
-            if stage in ("agent_step", "route", "worker"):
+            if stage in ("agent_step", "agent_plan", "agent_result", "agent_review", "auto_agent", "route", "worker"):  # 他の端末にも進み具合を見せる
                 self.bus.publish("run_stage", run_id=run.id, conversation_id=run.conversation_id, stage=stage,
-                                 **{k: v for k, v in info.items() if k in ("label", "detail", "n", "role", "model")})
+                                 **{k: (v[:300] if isinstance(v, str) else v) for k, v in info.items()
+                                    if k in ("label", "detail", "n", "role", "model", "thought", "step", "steps", "ok", "output", "tool", "missing",
+                                             "about")})
 
         status = "done"
         try:
@@ -298,7 +304,8 @@ class RunManager:
             meta = {"status": "done", "interaction_id": result.id, "role": result.role, "model": result.model,
                     "source": result.source, "route_source": result.route_source, "tokens": result.tokens,
                     "latency_s": round(result.latency_s, 3), "examples_used": result.examples_used,
-                    "tool_calls": [{k: c.get(k) for k in ("name", "label", "detail", "ok")} for c in result.tool_calls],
+                    "tool_calls": [{k: c.get(k) for k in ("name", "label", "detail", "ok", "thought", "step")} for c in result.tool_calls],
+                    "plan": result.plan,
                     "subresults": data.get("subresults", []), "escalated": data.get("escalated"),
                     "sources": data.get("sources") or [], "changes": data.get("changes") or []}
             message = chats.update_message(run.assistant_message_id, content=result.text, meta=meta, touch_conversation=True)

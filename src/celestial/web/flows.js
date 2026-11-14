@@ -10,12 +10,19 @@ const FLOW_ICONS = {
   file: "M3 6.5A1.5 1.5 0 0 1 4.5 5H8l1.5 2h6A1.5 1.5 0 0 1 17 8.5v6a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 3 14.5z",
   ai: "M10 2.5l1.6 4.4L16 8.5l-4.4 1.6L10 14.5l-1.6-4.4L4 8.5l4.4-1.6zM15.5 13l.7 1.8 1.8.7-1.8.7-.7 1.8-.7-1.8-1.8-.7 1.8-.7z",
   decide: "M10 3v14M5 17h10M4 7h12M4 7l-2 5h4zM16 7l-2 5h4z",
+  news: "M3 5h11v10a1 1 0 0 0 1 1h1a1 1 0 0 0 1-1V7h-3M6 8h5M6 11h5M6 14h3",
+  web_search: "M8.5 3.5a5 5 0 1 0 0 10a5 5 0 0 0 0-10zM12.5 12.5L17 17",
   fetch: "M10 3a7 7 0 1 0 0 14 7 7 0 0 0 0-14zM3 10h14M10 3c2 2 2.8 4.4 2.8 7S12 15 10 17M10 3C8 5 7.2 7.4 7.2 10S8 15 10 17",
   post: "M3 10l14-6-5 14-2.5-5.5zM9.5 12.5L17 4",
+  kb_search: "M4 4h5a2 2 0 0 1 2 2v10a1.5 1.5 0 0 0-1.5-1.5H4zM16 4h-5a2 2 0 0 0-2 2v10a1.5 1.5 0 0 1 1.5-1.5H16z",
+  tool: "M13.5 3.5a3 3 0 0 0-4 3.8L4 12.8V16h3.2l5.5-5.5a3 3 0 0 0 3.8-4l-2 2-1.5-1.5z",
+  transform: "M3.5 6h5l-2-2m2 2-2 2M16.5 14h-5l2 2m-2-2 2-2",
   read_file: "M5 2.5h6.5L15 6v11.5H5zM11.5 2.5V6H15M7.5 10h5M7.5 13h5",
   write_file: "M4 16l1-4 8.5-8.5a1.4 1.4 0 0 1 2 2L7 14zM12.5 4.5l3 3",
   document: "M5 2.5h6.5L15 6v11.5H5zM11.5 2.5V6H15M7.5 9.5h5M7.5 12h5M7.5 14.5h3",
   command: "M3 4.5h14v11H3zM6 8l2.5 2L6 12M10 12.5h4",
+  python: "M7 4.5h5a2 2 0 0 1 2 2V9H6v2.5H4V6.5a2 2 0 0 1 2-2zM13 15.5H8a2 2 0 0 1-2-2V11h8V8.5h2v5a2 2 0 0 1-2 2z",
+  for_each: "M4 5.5h12M4 10h12M4 14.5h7M14.5 12l2.5 2.5-2.5 2.5",
   notify: "M6 8a4 4 0 0 1 8 0c0 4 1.5 5 1.5 5h-11S6 12 6 8zM8.5 15.5a1.5 1.5 0 0 0 3 0",
   condition: "M10 2.5l7.5 7.5-7.5 7.5L2.5 10z",
   template: "M4 5h12M4 8.5h12M4 12h8M4 15.5h10",
@@ -60,9 +67,17 @@ function flowBuilderPanel() {
     catch (e) { toast(e.message); }
     finally { go.disabled = false; go.textContent = "AIで下書きを作る"; }
   });
+  const tplPick = (FLOWS && FLOWS.templates && FLOWS.templates.length)
+    ? h("div", { class: "flow-templates" }, h("span", { class: "note" }, "ひな形から作る:"), " ",
+        FLOWS.templates.map((t) => h("button", { type: "button", class: "chip", onclick: () => {
+          flowEditing = JSON.parse(JSON.stringify({ name: t.name, enabled: false, trigger: t.trigger, steps: t.steps }));
+          renderFlows();
+        } }, t.name)))
+    : null;
   return h("div", { class: "panel flow-builder" },
     h("h2", {}, "AIで作る", h("small", {}, "やりたいことを書くと、きっかけと手順の下書きを作ります")),
     text,
+    tplPick,
     h("div", { class: "field-row" },
       h("span", { class: "note" }, "下書きは止めた状態で作ります。内容を確かめてから有効にしてください。"),
       h("span", {}, h("button", { type: "button", class: "ghost", onclick: () => { flowEditing = blankFlow(); renderFlows(); } }, "自分で作る"), " ", go)));
@@ -194,12 +209,23 @@ function flowEditor(flow) {
     ai: [["prompt", "area", "AIへの依頼(例: 次の文章を3行に要約して: {{prev}})"]],
     decide: [["question", "text", "質問(例: この問い合わせの緊急度は?)"], ["options", "area", "選択肢(1行に1つ。空なら はい/いいえ)"],
       ["context", "area", "判断の材料(空なら前の手順の結果。確率は {{stepN.probability}})"]],
+    news: [["topic", "text", "話題(空なら主要ニュース)"], ["lang", "select", "言語", { ja: "日本語", en: "English" }], ["limit", "number", "件数(1〜15)"]],
+    web_search: [["query", "text", "検索する言葉(例: {{trigger}})"], ["lang", "select", "言語", { ja: "日本語", en: "English" }], ["limit", "number", "件数(1〜15)"]],
     fetch: [["url", "text", "読むページのアドレス"]],
     post: [["url", "text", "送り先のアドレス(Slack・Discord の Webhook など)"], ["body", "area", "送る内容(JSON も可)"]],
+    kb_search: [["query", "text", "知識ベースの検索語(例: {{trigger}})"], ["top_k", "number", "件数(1〜12)"]],
+    tool: [["name", "text", "ツール名(例: calc, code_check, convert_file, image_edit, qr_barcode, web_extract)"],
+      ["args", "area", "引数(JSON形式。例: {\"path\": \".\"})"]],
+    transform: [["action", "select", "処理", { json_get: "JSONキー取得", regex: "正規表現抽出", lines: "空行除去・整形", split: "区切り分割", trim: "前後空白削除", upper: "大文字化", lower: "小文字化", count: "文字/行数カウント" }],
+      ["input", "area", "入力(空なら前の手順の結果 {{prev}})"],
+      ["arg", "text", "キーパス(a.b.0)・正規表現パターン・区切り文字"]],
     read_file: [["path", "text", "ファイル(作業フォルダの中)"]],
     write_file: [["path", "text", "ファイル(作業フォルダの中)"], ["content", "area", "書く内容"], ["mode", "select", "書き方", { overwrite: "上書き", append: "末尾に追記" }]],
-    document: [["kind", "select", "種類", { docx: "Word", xlsx: "Excel", pptx: "PowerPoint" }], ["path", "text", "ファイル名"], ["content", "area", "内容(Markdown。Excel は CSV や表)"]],
+    document: [["kind", "select", "種類", { docx: "Word", xlsx: "Excel", pptx: "PowerPoint" }], ["path", "text", "ファイル名"],
+      ["mode", "select", "書き方(Word/PPTX)", { overwrite: "上書き", append: "末尾に追記" }], ["content", "area", "内容(Markdown。Excel は CSV や表)"]],
     command: [["command", "text", "コマンド(作業フォルダで実行)"]],
+    python: [["code", "area", "Python コード(作業フォルダで実行)"]],
+    for_each: [["items", "area", "処理する一覧(1行1件。空なら {{prev}})"], ["prompt", "area", "1件ごとの指示({{item}} に各行が入ります)"]],
     notify: [["title", "text", "題"], ["text", "area", "本文(空なら前の手順の結果)"], ["target", "select", "送り先", { all: "スマホと PC", phone: "スマホ", pc: "PC" }]],
     condition: [["value", "text", "調べる文字(例: {{prev}})"], ["op", "select", "比べ方", FLOWS.ops], ["match", "text", "比べる文字"]],
     template: [["text", "area", "文章({{prev}} などを差し込めます)"]],

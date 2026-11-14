@@ -128,7 +128,7 @@ class LocalAi extends ChangeNotifier {
   Future<LocalLlm> ensure(String name, {int contextSize = 4096, int threads = 0}) async {
     if (_llm != null && loadedName == name) return _llm!;
     final model = find(name);
-    if (model == null) throw LlmException('端末内のAI「$name」が見つかりません。「AIモデル」で入れてください');
+    if (model == null) throw LlmException('端末内のAI「$name」が見つかりません。設定の「AIモデル」で入れてください');
     await unload();
     loading = true;
     loadError = null;

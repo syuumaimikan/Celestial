@@ -28,12 +28,19 @@ from .tools import ToolContext, ToolError, execute
 STEP_TYPES: dict[str, dict] = {
     "ai": {"label": "AIに頼む", "fields": {"prompt": "依頼文"}},
     "decide": {"label": "判断する", "fields": {"question": "質問", "options": "選択肢", "context": "判断の材料"}},
+    "news": {"label": "ニュースを取る", "fields": {"topic": "話題(空なら主要)", "lang": "言語", "limit": "件数"}, "needs": "net"},
+    "web_search": {"label": "Web検索", "fields": {"query": "検索語", "lang": "言語", "limit": "件数"}, "needs": "net"},
     "fetch": {"label": "ウェブページを読む", "fields": {"url": "アドレス"}, "needs": "net"},
     "post": {"label": "ウェブに送る", "fields": {"url": "送り先のアドレス", "body": "送る内容"}, "needs": "net"},
+    "kb_search": {"label": "知識ベース検索", "fields": {"query": "検索する言葉", "top_k": "件数"}},
+    "tool": {"label": "拡張ツールを実行", "fields": {"name": "ツール名", "args": "引数(JSON)"}},
+    "transform": {"label": "テキスト・JSON整形", "fields": {"action": "処理", "input": "入力", "arg": "キー/パターン"}},
     "read_file": {"label": "ファイルを読む", "fields": {"path": "ファイル"}, "needs": "files"},
     "write_file": {"label": "ファイルに書く", "fields": {"path": "ファイル", "content": "内容", "mode": "書き方"}, "needs": "write"},
-    "document": {"label": "文書を作る", "fields": {"kind": "種類", "path": "ファイル", "content": "内容"}, "needs": "write"},
+    "document": {"label": "文書を作る", "fields": {"kind": "種類", "path": "ファイル", "mode": "書き方", "content": "内容"}, "needs": "write"},
     "command": {"label": "コマンドを実行", "fields": {"command": "コマンド"}, "needs": "run"},
+    "python": {"label": "Pythonを実行", "fields": {"code": "Python コード"}, "needs": "run"},
+    "for_each": {"label": "行ごとにAI処理", "fields": {"items": "対象(1行1件)", "prompt": "指示({{item}}が1件分)"}},
     "notify": {"label": "通知する", "fields": {"title": "題", "text": "本文", "target": "送り先"}},
     "condition": {"label": "条件に合わなければ止める", "fields": {"value": "調べる文字", "op": "比べ方", "match": "比べる文字"}},
     "template": {"label": "文章を組み立てる", "fields": {"text": "文章"}},
@@ -41,7 +48,32 @@ STEP_TYPES: dict[str, dict] = {
 }
 TRIGGER_TYPES = {"manual": "手動", "schedule": "決まった時刻", "interval": "一定の間隔", "webhook": "Webhook", "file": "ファイルの追加"}
 CONDITION_OPS = {"contains": "を含む", "not_contains": "を含まない", "equals": "と同じ", "regex": "に当てはまる(正規表現)",
-                 "empty": "が空", "not_empty": "が空でない"}
+                 "empty": "が空", "not_empty": "が空でない",
+                 "gt": "より大きい(数値)", "lt": "より小さい(数値)", "gte": "以上(数値)", "lte": "以下(数値)",
+                 "json_has": "にJSONキーがある"}
+TRANSFORM_OPS = {"json_get", "regex", "lines", "trim", "upper", "lower", "split", "count"}
+FLOW_TEMPLATES = [
+    {"id": "news_digest", "name": "朝のニュース要約", "trigger": {"type": "schedule", "time": "08:00", "days": [0, 1, 2, 3, 4, 5, 6]},
+     "steps": [{"type": "news", "label": "最新ニュース取得", "topic": "", "lang": "ja", "limit": "8"},
+               {"type": "ai", "label": "3行に要約", "prompt": "次のニュース見出しから重要な3件を簡潔に要約して:\n{{prev}}"},
+               {"type": "notify", "label": "通知", "title": "今日のニュース", "text": "{{prev}}", "target": "all"}]},
+    {"id": "file_watch_summary", "name": "追加ファイルの自動要約・記録", "trigger": {"type": "file", "folder": ".", "pattern": "*.txt"},
+     "steps": [{"type": "read_file", "label": "ファイルを読む", "path": "{{trigger.path}}"},
+               {"type": "ai", "label": "要約する", "prompt": "次の内容を箇条書き3点で要約して:\n{{prev}}"},
+               {"type": "write_file", "label": "日報に追記", "path": "summary_log.md", "mode": "append", "content": "\n## {{date}} {{trigger.name}}\n{{prev}}\n"}]},
+    {"id": "kb_briefing", "name": "知識ベース参照レポート", "trigger": {"type": "manual"},
+     "steps": [{"type": "kb_search", "label": "資料を検索", "query": "{{trigger}}", "top_k": "5"},
+               {"type": "ai", "label": "レポート作成", "prompt": "次の検索結果を踏まえて質問「{{trigger}}」への回答を整理して:\n{{prev}}"},
+               {"type": "document", "label": "Word出力", "kind": "docx", "path": "kb_report.docx", "mode": "overwrite", "content": "# レポート\n\n{{prev}}"}]},
+    {"id": "web_research_report", "name": "Web調査レポート作成", "trigger": {"type": "manual"},
+     "steps": [{"type": "web_search", "label": "公開情報を検索", "query": "{{trigger}}", "lang": "ja", "limit": "6"},
+               {"type": "ai", "label": "調査をまとめる", "prompt": "次の検索結果から要点と出典URLを構造化して整理して:\n{{prev}}"},
+               {"type": "document", "label": "Word保存", "kind": "docx", "path": "research_report.docx", "mode": "overwrite", "content": "# Web調査レポート\n\n{{prev}}"}]},
+    {"id": "code_audit", "name": "コード自動チェック", "trigger": {"type": "manual"},
+     "steps": [{"type": "tool", "label": "コード検査", "name": "code_check", "args": "{\"path\": \".\"}"},
+               {"type": "ai", "label": "結果要約", "prompt": "次の検査結果を確認し、問題があれば修正案を示して:\n{{prev}}"},
+               {"type": "notify", "label": "通知", "title": "コード検査結果", "text": "{{prev}}", "target": "all"}]},
+]
 NEEDS_LABEL = {"net": "「ネットの利用を許可」", "files": "作業フォルダの設定", "write": "「ファイルの変更を許可」",
                "run": "「コマンドと Python の実行を許可」"}
 WEEKDAYS = "月火水木金土日"
@@ -104,10 +136,14 @@ def normalize_flow(data: dict) -> dict:
         clean = {"type": step["type"], "label": _text(step.get("label"), 60).strip()}
         for field in spec["fields"]:
             clean[field] = _text(step.get(field))
-        if step["type"] == "write_file":
-            clean["mode"] = "append" if clean["mode"] == "append" else "overwrite"
+        if step["type"] in ("write_file", "document"):
+            clean["mode"] = "append" if clean.get("mode") == "append" else "overwrite"
         if step["type"] == "document":
             clean["kind"] = clean["kind"] if clean["kind"] in ("docx", "xlsx", "pptx") else "docx"
+        if step["type"] in ("news", "web_search"):
+            clean["lang"] = clean["lang"] if clean["lang"] in ("ja", "en") else "ja"
+        if step["type"] == "transform":
+            clean["action"] = clean["action"] if clean["action"] in TRANSFORM_OPS else "trim"
         if step["type"] == "notify":
             clean["target"] = clean["target"] if clean["target"] in ("all", "pc", "phone") else "all"
         if step["type"] == "condition":
@@ -117,8 +153,9 @@ def normalize_flow(data: dict) -> dict:
                 clean["seconds"] = str(max(0, min(600, int(float(clean["seconds"] or 0)))))
             except ValueError:
                 raise ValueError(f"{i}番目の手順(待つ)の秒数は数で書いてください") from None
-        required = {"ai": "prompt", "decide": "question", "fetch": "url", "post": "url", "read_file": "path", "write_file": "path",
-                    "document": "path", "command": "command", "template": "text"}.get(step["type"])
+        required = {"ai": "prompt", "decide": "question", "web_search": "query", "fetch": "url", "post": "url", "kb_search": "query",
+                    "tool": "name", "read_file": "path", "write_file": "path", "document": "path", "command": "command",
+                    "python": "code", "for_each": "prompt", "template": "text"}.get(step["type"])
         if required and not clean[required].strip():
             raise ValueError(f"{i}番目の手順({spec['label']})の「{spec['fields'][required]}」を入れてください")
         clean_steps.append(clean)
@@ -175,6 +212,19 @@ def check(value: str, op: str, match: str) -> bool:
             return re.search(match, value) is not None
         except re.error as e:
             raise ValueError(f"正規表現が正しくありません: {e}") from e
+    if op in ("gt", "lt", "gte", "lte"):
+        try:
+            lv = float(re.sub(r",", "", value.strip()))
+            rv = float(re.sub(r",", "", match.strip()))
+        except ValueError:
+            return False
+        return (lv > rv if op == "gt" else lv < rv if op == "lt" else lv >= rv if op == "gte" else lv <= rv)
+    if op == "json_has":
+        try:
+            obj = json.loads(value)
+            return isinstance(obj, dict) and match.strip() in obj
+        except ValueError:
+            return False
     return match in value
 
 
@@ -345,6 +395,9 @@ class FlowEngine:
         return started
 
     def _workspace(self) -> Path | None:
+        root = getattr(self.app, "workspace_root", None)
+        if root is not None:
+            return root()
         folder = self.app.cfg.workspace
         return Path(folder) if folder and Path(folder).is_dir() else None
 
@@ -425,6 +478,14 @@ class FlowEngine:
                 if isinstance(result, tuple):  # (結果, 付け足しの値): 判断の確率など。{{step2.probability}} で使える
                     result, extras = result
                 result = _text(result, MAX_OUTPUT)
+                if not extras and result.strip().startswith("{"):
+                    try:
+                        parsed = json.loads(result)
+                        if isinstance(parsed, dict):
+                            extras = {str(k): (v if isinstance(v, str) else json.dumps(v, ensure_ascii=False))
+                                      for k, v in parsed.items() if isinstance(k, str)}
+                    except ValueError:
+                        pass
                 values[f"step{number}"] = values["prev"] = result
                 for key, value in extras.items():
                     values[f"step{number}.{key}"] = values[f"prev.{key}"] = value
@@ -457,7 +518,8 @@ class FlowEngine:
         cfg = self.app.cfg
         # 確認なしで動かす(流れを作った人が PC の画面で手順を決めているため)。許可していない種類の手順は道具が断る
         return ToolContext(workspace=self._workspace(), allow_write=cfg.tools_write, allow_run=cfg.tools_run,
-                           allow_net=cfg.tools_net, backup_dir=cfg.home / "backups", confirm=False, scratch_dir=cfg.home / "scratch")
+                           allow_net=cfg.tools_net, backup_dir=cfg.home / "backups", confirm=False,
+                           scratch_dir=cfg.home / "scratch", kb=getattr(self.app, "kb", None))
 
     def _need(self, step: dict, ctx: ToolContext) -> None:
         need = STEP_TYPES[step["type"]].get("needs")
@@ -476,6 +538,26 @@ class FlowEngine:
             options = [o.strip() for o in re.split(r"[\n,、]", r["options"]) if o.strip()]
             decision = self.app.decide(r["question"], options or None, r["context"] if r["context"].strip() else values.get("prev", ""))
             return decision.answer, {"probability": f"{decision.probability:.2f}"}
+        if kind == "news":
+            return execute(ctx, "news", {"topic": r["topic"], "lang": r["lang"] or "ja", "limit": r["limit"] or "8"})
+        if kind == "web_search":
+            return execute(ctx, "web_search", {"query": r["query"], "lang": r["lang"] or "ja", "limit": r["limit"] or "8"})
+        if kind == "kb_search":
+            return execute(ctx, "kb_search", {"query": r["query"], "top_k": r["top_k"] or "5"})
+        if kind == "tool":
+            raw_args = r["args"].strip()
+            if raw_args:
+                try:
+                    parsed_args = json.loads(raw_args)
+                except ValueError as e:
+                    raise ToolError(f"引数(JSON)の形式が正しくありません: {e}") from e
+                if not isinstance(parsed_args, dict):
+                    raise ToolError("引数(JSON)はオブジェクト形式で指定してください")
+            else:
+                parsed_args = {}
+            return execute(ctx, r["name"].strip(), parsed_args)
+        if kind == "transform":
+            return _transform_text(r["action"], r["input"] if r["input"] != "" else values.get("prev", ""), r["arg"])
         if kind == "fetch":
             return execute(ctx, "fetch_url", {"url": r["url"].strip()})
         if kind == "post":
@@ -487,10 +569,31 @@ class FlowEngine:
             return r["content"]
         if kind == "document":
             path = r["path"] if r["path"].lower().endswith("." + r["kind"]) else f"{r['path']}.{r['kind']}"
+            if r["mode"] == "append":
+                return execute(ctx, "append_file", {"path": path, "content": r["content"]})
             tool = {"docx": "make_word", "xlsx": "make_excel", "pptx": "make_slides"}[r["kind"]]
             return execute(ctx, tool, {"path": path, ("data" if r["kind"] == "xlsx" else "content"): r["content"]})
         if kind == "command":
             return execute(ctx, "run_command", {"command": r["command"]})
+        if kind == "python":
+            return execute(ctx, "run_python", {"code": r["code"]})
+        if kind == "for_each":
+            raw_items = r["items"].strip() or values.get("prev", "")
+            items: list[str] = []
+            if raw_items.startswith("["):
+                try:
+                    loaded = json.loads(raw_items)
+                    if isinstance(loaded, list):
+                        items = [x if isinstance(x, str) else json.dumps(x, ensure_ascii=False) for x in loaded]
+                except ValueError:
+                    items = []
+            if not items:
+                items = [ln.strip() for ln in raw_items.splitlines() if ln.strip()]
+            out_lines = []
+            for item in items[:20]:
+                sub_vals = {**values, "item": item}
+                out_lines.append(self.app.run(render(step["prompt"], sub_vals)).text.strip())
+            return "\n".join(out_lines)
         if kind == "notify":
             text = r["text"] or values.get("prev", "")
             target = {"pc": "pc", "phone": None, "all": None}[r["target"]]
@@ -511,6 +614,31 @@ class FlowEngine:
         raise ValueError(f"未知の手順: {kind}")
 
 
+def _transform_text(action: str, src: str, arg: str = "") -> str:
+    act = (action or "trim").strip().lower()
+    if act == "json_get":
+        cur = json.loads(src)
+        for key in [k for k in arg.split(".") if k != ""]:
+            cur = cur[int(key)] if isinstance(cur, list) else cur[key]
+        return cur if isinstance(cur, str) else json.dumps(cur, ensure_ascii=False)
+    if act == "regex":
+        found = re.findall(arg, src)
+        items = [("|".join(x) if isinstance(x, tuple) else x) for x in found]
+        return "\n".join(items)
+    if act == "lines":
+        return "\n".join(ln.strip() for ln in src.splitlines() if ln.strip())
+    if act == "split":
+        sep = arg or ","
+        return "\n".join(p.strip() for p in src.split(sep) if p.strip())
+    if act == "upper":
+        return src.upper()
+    if act == "lower":
+        return src.lower()
+    if act == "count":
+        return json.dumps({"chars": len(src), "lines": len(src.splitlines()), "words": len(src.split())}, ensure_ascii=False)
+    return src.strip()
+
+
 def _error_text(e: Exception) -> str:
     return str(e.args[0]) if getattr(e, "args", None) else f"{type(e).__name__}"
 
@@ -527,6 +655,9 @@ Steps (type: fields):
 - decide: question, options (one per line; empty means yes/no), context (default {{prev}})  (picks one option with a probability;
   the result is the chosen option text, so a following condition step can branch on it)
 - fetch: url (read a public web page as text)
+- web_search: query, lang (ja or en), limit
+- tool: name (e.g. calc, convert_file, image_edit, qr_barcode, code_check, web_extract), args (JSON string)
+- transform: action (json_get, regex, lines, split, trim, upper, lower, count), input (default {{prev}}), arg (JSON key path / regex / delimiter)
 - post: url, body (send text/JSON to a public webhook URL)
 - read_file: path (a file in the workspace)
 - write_file: path, content, mode (overwrite or append)

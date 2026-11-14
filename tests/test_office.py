@@ -58,6 +58,26 @@ class OfficeTest(unittest.TestCase):
         self.assertEqual(cells["B4"].find(f"{S}f").text, "SUM(B2:B3)")
         self.assertEqual(cells["B4"].get("s"), "2")
 
+    def test_excel_without_header_and_text_column(self):
+        # 小さいAIは見出しを付けず、合計の式で文字の列(A)を指しがち: データは1行目から、式は数の列(B)に直す
+        path = office.write_xlsx(self.dir / "r.xlsx", "4月,120\n5月,135\n6月,128\n合計,=SUM(A2:A4)")
+        cells = {c.get("r"): c for c in parts(path)["xl/worksheets/sheet1.xml"].iter(f"{S}c")}
+        self.assertEqual(cells["B4"].find(f"{S}f").text, "SUM(B1:B3)")
+        self.assertIsNone(cells["A1"].get("s"))                      # 1行目はデータなので、見出しの書式にしない
+        self.assertIn("=SUM(B1:B3) → 383", office.with_results(office.read_text(path)))
+        # 年が並ぶ1行目は見出しのまま
+        years = office.write_xlsx(self.dir / "y.xlsx", "地域,2023,2024\n東京,100,200\n大阪,50,70\n合計,=SUM(above),=SUM(above)")
+        self.assertIn("=SUM(C2:C3) → 270", office.with_results(office.read_text(years)))
+
+    def test_results_show_empty_ranges(self):
+        shown = office.with_results("[シート: S]\n名前,点\nA,x\nB,y\n合計,=SUM(B2:B3)\n平均,=AVERAGE(B2:B3)")
+        self.assertIn("=SUM(B2:B3) → 0(B2:B3 に数がありません)", shown)
+        self.assertIn("=AVERAGE(B2:B3) → エラー", shown)
+        ctx = ToolContext(self.dir, allow_write=True, confirm=False)
+        made = execute(ctx, "make_excel", {"path": "売上.xlsx", "data": "月,売上\n4月,120\n5月,135\n合計,=SUM(above)"})
+        self.assertIn("=SUM(B2:B3) → 255", made)                      # 作ったときに、できた表を結果つきで見せる
+        self.assertIn("=SUM(B2:B3) → 255", execute(ctx, "read_file", {"path": "売上.xlsx"}))
+
     def test_excel_formulas_cover_the_data(self):
         circular = parts(office.write_xlsx(self.dir / "h.xlsx", "月,売上\n4月,100\n5月,200\n合計,=SUM(B2:B6)"))
         cells = {c.get("r"): c for c in circular["xl/worksheets/sheet1.xml"].iter(f"{S}c")}
@@ -207,11 +227,49 @@ class OfficeTest(unittest.TestCase):
         self.assertIn("=SUM(B2:B2)", sheet)  # 数式は数式として読める
         self.assertIn("要点", execute(ctx, "read_file", {"path": "報告.docx"}))
         self.assertIn("[スライド 2]", execute(ctx, "read_file", {"path": "発表.pptx"}))
-        for name, args in (("edit_file", {"path": "報告.docx", "old": "要点", "new": "x"}),
-                           ("append_file", {"path": "発表.pptx", "content": "x"})):
-            with self.assertRaises(ToolError) as caught:
-                execute(ctx, name, args)
-            self.assertIn("作り直して", str(caught.exception))  # Word・PowerPoint は壊さずに、作り直しを案内する
+        with self.assertRaises(ToolError) as caught:
+            execute(ctx, "edit_file", {"path": "報告.docx", "old": "要点", "new": "x"})
+        self.assertIn("作り直して", str(caught.exception))  # 部分置換は壊さずに、作り直しを案内する
+
+        append_msg = execute(ctx, "append_file", {"path": "報告.docx", "content": "\n\n## 追記\n追加テキスト"})
+        self.assertIn("追記", append_msg)
+        docx_text = execute(ctx, "read_file", {"path": "報告.docx"})
+        self.assertIn("要点", docx_text)
+        self.assertIn("追加テキスト", docx_text)
+
+        pptx_msg = execute(ctx, "append_file", {"path": "発表.pptx", "content": "# 3 枚目\n\n- 追加項目"})
+        self.assertIn("追記", pptx_msg)
+        pptx_text = execute(ctx, "read_file", {"path": "発表.pptx"})
+        self.assertIn("題", pptx_text)
+        self.assertIn("[スライド 2]", pptx_text)
+        self.assertIn("[スライド 3]", pptx_text)
+        self.assertIn("追加項目", pptx_text)
+
+        # stdlib PDF テキスト抽出 + make_chart (SVG / HTML) の検証
+        import zlib
+        pdf_stream = zlib.compress(b"BT /F1 12 Tf 72 720 Td (Celestial PDF Test) Tj ET")
+        pdf_bytes = (
+            b"%PDF-1.4\n"
+            b"1 0 obj<< /Type /Catalog /Pages 2 0 R >>endobj\n"
+            b"2 0 obj<< /Type /Pages /Kids [3 0 R] /Count 1 >>endobj\n"
+            b"3 0 obj<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>endobj\n"
+            b"4 0 obj<< /Length " + str(len(pdf_stream)).encode() + b" /Filter /FlateDecode >>stream\n"
+            + pdf_stream + b"\nendstream endobj\ntrailer<< /Root 1 0 R >>\n%%EOF"
+        )
+        (self.dir / "資料.pdf").write_bytes(pdf_bytes)
+        pdf_text = execute(ctx, "read_file", {"path": "資料.pdf"})
+        self.assertIn("Celestial PDF Test", pdf_text)
+
+        chart_msg = execute(ctx, "make_chart", {
+            "path": "グラフ.svg",
+            "title": "月別件数",
+            "kind": "bar",
+            "data": [{"label": "1月", "value": 12}, {"label": "2月", "value": 24}],
+        })
+        self.assertIn("グラフ", chart_msg)
+        svg = (self.dir / "グラフ.svg").read_text(encoding="utf-8")
+        self.assertIn("<svg", svg)
+        self.assertIn("月別件数", svg)
 
     def test_agent_edits_excel_as_csv(self):
         ctx = ToolContext(workspace=self.dir, allow_write=True, backup_dir=self.dir / ".backup")

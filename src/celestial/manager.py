@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime
 import json
 import math
+import os
 import re
 import threading
 import time
@@ -13,24 +14,38 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from . import ground
+from . import ground, knowledge
 from .backends import Backend, BackendError, Generation, Message, ModelInfo, create_backend
 from .backends.base import TIERS
 from .backends.native import read_models
 from .config import Config, load_config
 from .evolve import Embedder, LearnedRouter, Memory, Store
-from . import decide, project, web
-from .agent import run_agent
+from . import decide, knowhow, project, tools as toolbox, vision, web
+from .agent import is_continuation, run_agent, with_earlier_requests
+from .codecheck import markup_in_python
 from .tools import ToolContext, ToolError, summarize_changes
 from .workers import COMPLEX, COMPLEX_DESCRIPTION, ROLES, heuristic_role, plausible_role
 
 OnToken = Callable[[str], None]
 OnStage = Callable[[str, dict], None]  # 進行状況の通知(画面表示用)
 TUNABLE: dict[str, type] = {"cache": bool, "learned_routing": bool, "swarm_auto": bool, "fewshot_k": int, "manager_model": str,
-                             "semantic_search": bool, "cascade": bool, "workspace": str, "tools_write": bool, "tools_run": bool,
-                             "tools_pc": bool, "tools_net": bool, "tools_confirm": bool,
+                             "semantic_search": bool, "use_kb": bool, "cascade": bool, "workspace": str, "tools_write": bool, "tools_run": bool,
+                             "tools_pc": bool, "tools_net": bool, "tools_confirm": bool, "agent_mode": str, "agent_model": str,
+                             "tools_max_steps": int, "recent_folders": list,
                              "remote_enabled": bool, "remote_control": bool, "keep_running": bool,
                              "instructions": str, "memories": list, "memory_suggest": bool}
+# エージェントの権限のモード(弱い順)。最大の「すべて許可」は、作業フォルダの外も含めて、すべての編集・コマンドを確認なしで行う
+AGENT_MODES = {
+    "read": ("読み取りのみ", "ファイルを読む・探すだけ。変更やコマンドの実行はしません。"),
+    "ask": ("確認しながら", "ファイルの変更・コマンドの実行・PC の操作の前に、毎回内容を見せて許可を求めます。"),
+    "edit": ("編集は自動", "作業フォルダの中のファイルの作成・編集は自動。コマンドの実行と PC の操作の前に確認します。"),
+    "auto": ("すべて自動", "作業フォルダの中の編集もコマンドも自動。取り返しのつかないコマンドは止め、作業フォルダの外の変更・ネットからの取り込み・公開などの前だけ確認します。"),
+    "full": ("すべて許可", "すべてのコマンド・編集・PC の操作・ネットを、確認なしで許可します。作業フォルダの外も含め、PC のどこでも扱えます。"),
+}
+MAX_RECENT_FOLDERS = 12
+# 「すべて許可」以外では作業させないフォルダ(Windows やプログラムの置き場)
+_SYSTEM_FOLDER = re.compile(r"^[a-z]:[\\/]?$|^[a-z]:[\\/](windows|program files( \(x86\))?|programdata|\$recycle\.bin|system volume information)([\\/]|$)",
+                            re.I)
 MAX_INSTRUCTIONS = 1000   # AIへの指示の長さの上限(小さいAIの指示文を長くしすぎない)
 MAX_MEMORIES = 50         # 覚えておける件数
 MAX_MEMORY_CHARS = 200    # 1件の長さの上限
@@ -53,6 +68,39 @@ _LANG_ROLES = ("general", "code", "reason", "summarize", "write")
 
 
 _ATTACHMENT = re.compile(r"\n\n\[添付ファイル: [^\]\n]+\]\n````\n[\s\S]*?\n````")
+
+
+# ---- PC での作業が要る依頼か(エージェントを自動で使う) ---------------------------------
+# 「ファイル・フォルダ・コマンド」など PC の上のものに対する、作る・実行する・整理するなどの依頼。
+# 「作り方を教えて」のような質問や、「コードを書いて」(画面に見せれば足りる)は会話のまま答える。
+_ON_DISK = (r"(ファイル|フォルダー?|ディレクトリ|コマンド|リポジトリ|\bgit\b|サーバー|デスクトップ|作業フォルダ|ドキュメントフォルダ|"
+            r"エクセル|Excel|\bxlsx\b|ワード|\bWord\b|\bdocx\b|パワポ|PowerPoint|\bpptx\b|スライド|README|"
+            r"\bPDF\b|\bzip\b|\bsqlite\b|アーカイブ|"
+            r"\.(?:py|js|ts|html|css|json|txt|md|csv|tsv|pdf|zip|db|sqlite|bat|ps1|sh|toml|yaml|yml)\b)")
+_MAKE = (r"(作って|作成して|作ってください|作成してください|作っておいて|書いて|書き込んで|保存して|書き出して|出力して|置いて|"
+         r"整理して|移動して|削除して|消して|コピーして|名前を変えて|リネームして|分けて|まとめて|変換して|直して|修正して|追加して|"
+         r"更新して|初期化して|コミットして|開いて|読んで|調べて|探して|一覧にして|数えて)")
+_RUN = (r"(実行して|実行し|動かして|走らせて|インストールして|起動して|立ち上げて|ビルドして|テストして|試して|確かめて)")
+_CODEISH = r"(スクリプト|プログラム|コード|アプリ|ツール|テスト|Python|python|pip|npm|node|サーバー|ゲーム)"
+_AGENT_JA = re.compile(rf"{_ON_DISK}[^。\n]{{0,30}}?({_MAKE}|{_RUN})|{_CODEISH}[^。\n]{{0,30}}?{_RUN}|{_RUN}[^。\n]{{0,12}}?{_ON_DISK}"
+                       r"|(アン)?インストールして|エージェント(で|として|モード)|PC(上|の中)で(作業|実行)", re.I)
+_AGENT_EN = re.compile(r"\b(create|make|write|save|run|execute|install|build|delete|remove|move|rename|organi[sz]e|set up|init(?:ialize)?|"
+                       r"commit|start|launch)\b[^.\n]{0,40}?\b(file|files|folder|folders|directory|script|project|app|command|repo|"
+                       r"repository|server|tests?|excel|spreadsheet|document|slides?)\b", re.I)
+_HOW_TO = re.compile(r"(方法|やり方|仕方|手順を教|どうやって|どうすれば|どうしたら|とは[?？]?$|って何|教えて|説明して|書き方|作り方|使い方|"
+                     r"違い|意味|\bhow (to|do|can|should|would)\b|\bwhat (is|are)\b|\bexplain\b)", re.I)
+
+
+# スクリプト1本やファイルを名指しした依頼は、プロジェクト(複数のファイル・テスト・README)ではなく、普通のエージェントで進める
+_SMALL_JOB = re.compile(r"スクリプト|プログラム|\b[\w-]+\.(?:py|js|ts|html|css|bat|ps1|sh|txt|md|csv|json)\b|\b(?:script|program)\b", re.I)
+
+
+def needs_agent(task: str) -> bool:
+    """PC の上で作業する依頼か(ファイルやフォルダを作る・コマンドを実行する・プロジェクトを作るなど)。"""
+    text = _ATTACHMENT.sub("", task).strip()
+    if not text or _HOW_TO.search(text):
+        return False
+    return bool(_AGENT_JA.search(text) or _AGENT_EN.search(text) or project.looks_like_project_request(text))
 
 
 def routing_text(task: str) -> str:
@@ -313,18 +361,19 @@ def _date_items(task: str, memories: list[str], today: datetime.date) -> list[tu
 # ---- 利用者に合わせる(AIへの指示と、覚えていること) -------------------------------------
 # 「覚えて」「忘れて」は、AIに判断させずに決まった言い方で受け付ける(小さいAIは記憶の道具をうまく使えないため)。
 _REMEMBER = (
-    re.compile(r"^(?:覚えて(?:おいて)?|記憶して(?:おいて)?|メモして(?:おいて)?)(?:ください)?\s*[:：、,]\s*(?P<fact>.+)$", re.S),
-    re.compile(r"^(?P<fact>.+?)(?:だ|です)?(?:ということ|こと)?(?:を|と|って)(?:覚えて|記憶して)(?:おいて)?(?:ください|ね|ほしい)?[。.!！]*$", re.S),
+    re.compile(r"^(?:(?:これを)?覚えて(?:おいて|おいてください|ね|ほしい)?|記憶して(?:おいて|おいてください)?|メモして(?:おいて)?)(?:ください)?\s*[:：、,]\s*(?P<fact>.+)$", re.S),
+    re.compile(r"^(?:これから|今後(?:のために)?)?\s*(?P<fact>.+?)(?:だ|です)?(?:ということ|こと)?(?:を|と|って|は)(?:覚えて|記憶して)(?:おいて|おいてね|いて)?(?:ください|ね|ほしい)?[。.!！]*$", re.S),
+    re.compile(r"^(?:覚えておいて|記憶しといて|覚えてて)(?:ほしい)?(?:こと|のは)[は:：、]?\s*(?P<fact>.+?)[。.!！]*$", re.S),
     re.compile(r"^remember(?: that)?[:,]?\s+(?P<fact>.+)$", re.I | re.S),
 )
 _FORGET = (
-    re.compile(r"^(?:忘れて|削除して)(?:ください)?\s*[:：、,]\s*(?P<fact>.+)$", re.S),
-    re.compile(r"^(?P<fact>.+?)(?:のこと)?(?:を|は)忘れて(?:ください|ね)?[。.!！]*$", re.S),
-    re.compile(r"^forget(?: that)?[:,]?\s+(?P<fact>.+)$", re.I | re.S),
+    re.compile(r"^(?:忘れて|削除して|メモリから消して)(?:ください)?\s*[:：、,]\s*(?P<fact>.+)$", re.S),
+    re.compile(r"^(?P<fact>.+?)(?:のこと)?(?:を|は)(?:メモリから)?(?:忘れて|忘却して|消して|削除して)(?:ください|ね|いいよ|いい)?[。.!！]*$", re.S),
+    re.compile(r"^forget(?: that| about)?[:,]?\s+(?P<fact>.+)$", re.I | re.S),
 )
-_RECALL = re.compile(r"^(?:何を覚えて(?:い)?る(?:の)?|覚えていること(?:を(?:教えて|見せて))?|メモリ(?:を見せて|の一覧)?|what do you remember)"
-                     r"(?:ください)?[。.??]*$", re.I)
-_DEMONSTRATIVE = re.compile(r"^(?:それ|これ|あれ|この|その|あの|上の|上記|今の|さっき|先ほど)")
+_RECALL = re.compile(r"^(?:(?:私について)?何を?覚えて(?:い)?る(?:の)?|覚えていること|覚えたこと|(?:メモリ|記憶)(?:の一覧)?)(?:を(?:教えて|見せて))?(?:ください|ね)?[。.??!！]*$|"
+                     r"^what do you remember(?: about me)?[?？.!]*$", re.I)
+_DEMONSTRATIVE = re.compile(r"^(?:それ|これ|あれ|この|その|あの|上の|上記|今の|さっき|先ほど)$")
 
 
 def memory_command(text: str) -> tuple[str, str] | None:
@@ -340,23 +389,38 @@ def memory_command(text: str) -> tuple[str, str] | None:
             found = pattern.match(text)
             if found:
                 fact = re.sub(r"\s+", " ", found.group("fact")).strip(" 「」『』\"'。.、,")
-                if not fact or _DEMONSTRATIVE.match(fact):
+                if not fact or _DEMONSTRATIVE.match(fact) or re.match(r"^(?:それ|これ|あれ)(?:の|を|は|が|$)|^(?:この|その|あの)\S", fact):
                     return None
                 return kind, fact[:MAX_MEMORY_CHARS]
     return None
 
 
-_FIRST_PERSON = re.compile(r"私|僕|俺|わたし|あたし|うち(?:の|は)|自分|我が家|うちの|妻|夫|息子|娘|子ども|子供|家族|\b(I|I'm|I am|my|me)\b")
+_FIRST_PERSON = re.compile(
+    r"私|僕|俺|わたし|あたし|うち(?:の|は)|自分|我が家|妻|夫|息子|娘|子ども|子供|家族|"
+    r"毎日|毎朝|毎晩|毎週|最近|仕事|職業|趣味|出身|住んで|暮らして|飼って|勉強|苦手|得意|アレルギー|誕生日|目標|"
+    r"\b(I|I'm|I am|I've|my|me|every day|every morning)\b", re.I,
+)
 _MEMORY_GATE = ("この発言には、今後の会話でも役立つ、利用者自身についての事実(名前・好み・習慣・仕事・家族・住んでいる所・"
-                "予定など)が含まれていますか?")
+                "勉強中のこと・予定など)が含まれていますか?")
 _MEMORY_REWRITE = ("Extract the lasting personal fact about the user from the message, as one short declarative sentence in the user's "
                    "language, written from the user's point of view (in Japanese, start with 私は and end with a plain form like 〜している。). "
                    "Do not reply to the message. Output only the sentence. If there is no such fact, output NONE.")
-_GATE_SHOTS = [("私は猫を2匹飼っています。名前の案を出して", 0), ("東京タワーの高さは?", 1),
-               ("僕は看護師で夜勤があります。眠りの質を上げるには?", 0), ("私にもわかるように量子力学を説明して", 1)]
-_MEMORY_SHOTS = [("私は猫を2匹飼っています。名前の案を出して", "私は猫を2匹飼っている。"),
-                 ("東京タワーの高さは?", "NONE"),
-                 ("妻が来週誕生日なので、プレゼントの案を考えて", "私の妻の誕生日は来週。")]
+_GATE_SHOTS = [
+    ("私は猫を2匹飼っています。名前の案を出して", 0),
+    ("東京タワーの高さは?", 1),
+    ("僕は看護師で夜勤があります。眠りの質を上げるには?", 0),
+    ("私にもわかるように量子力学を説明して", 1),
+    ("毎日朝6時に起きてランニングをしています。朝ごはんのおすすめは?", 0),
+    ("最近Pythonの勉強を始めました。最初におすすめの練習課題は?", 0),
+    ("Pythonでファイルを読み込む方法を教えて", 1),
+]
+_MEMORY_SHOTS = [
+    ("私は猫を2匹飼っています。名前の案を出して", "私は猫を2匹飼っている。"),
+    ("東京タワーの高さは?", "NONE"),
+    ("妻が来週誕生日なので、プレゼントの案を考えて", "私の妻の誕生日は来週。"),
+    ("毎日朝6時に起きます", "私は毎日朝6時に起きている。"),
+    ("最近Pythonを勉強し始めました", "私は最近Pythonを勉強し始めた。"),
+]
 
 
 def personal_prompt(instructions: str, memories: list[str]) -> str:
@@ -448,7 +512,8 @@ class _Gate:
         if self.check_language and wrong_language(text, self.role):
             raise _Reject("lang")
         conf = self.confidence
-        if self.threshold is not None and conf is not None and len(self.logprobs) >= _MIN_TOKENS and conf < self.threshold:
+        min_tokens = 1 if self.finished else _MIN_TOKENS
+        if self.threshold is not None and conf is not None and len(self.logprobs) >= min_tokens and conf < self.threshold:
             raise _Reject("unsure")
         self.release()
 
@@ -476,6 +541,7 @@ class Result:
     escalated: dict | None = None    # 答え直したとき {"from", "to", "reason", "confidence"}
     sources: list[dict] = field(default_factory=list)  # 裏付けに使った資料 [{"title", "url"}]
     changes: list[dict] = field(default_factory=list)  # エージェントが変えたファイルと差分 [{"path", "status", "added", "removed", "diff"}]
+    plan: list[str] = field(default_factory=list)      # エージェントが立てた手順
 
 
 def _emit(on_stage: OnStage | None, stage: str, **data) -> None:
@@ -513,6 +579,7 @@ class Celestial:
         for row in self.store.study_rows():  # 自習で作った練習問題は、担当が最初から分かっている
             self.router.add(row["task"], row["role"])
         self.embedder = Embedder(self.backends, self.store, self.cfg.embed_model)
+        self.kb = knowledge.KnowledgeBase(self.store, embedder=self.embedder, semantic=lambda: self.cfg.semantic_search)
         self.memory = Memory(embedder=self.embedder, semantic=lambda: self.cfg.semantic_search,
                              min_sim_semantic=self.cfg.fewshot_min_sim_semantic)
         for row in self.store.good_examples():
@@ -540,12 +607,20 @@ class Celestial:
                 if not found:
                     raise BackendError("; ".join(errors) or "利用可能なモデルがありません。`ollama pull <model>` で導入してください。")
             # Ollama に書き出し済みの自作AIは Ollama 側だけを使う(同じモデルを二重に数えない)。
-            # 自作AIは小さくても管理AIには選ばない。
-            exported = {m["name"]: m["ollama"] for m in read_models(self.cfg.home / "models") if m.get("ollama")}
+            # 自作AIは原則小さくても管理AIにしないが、明示的に can_manage=True が書かれた高性能/エージェント/判定特化型は許可する。
+            meta_list = read_models(self.cfg.home / "models")
+            exported = {m["name"]: m["ollama"] for m in meta_list if m.get("ollama")}
+            by_name = {m["name"]: m for m in meta_list}
+            by_ollama = {m["ollama"]: m for m in meta_list if m.get("ollama")}
             names = {m.name for m in found}
             found = [m for m in found if not (m.name in exported and exported[m.name] in names)]
             for m in found:
-                if m.name in exported.values() or m.name.startswith("celestial-"):
+                meta = by_ollama.get(m.name) or by_name.get(m.name)
+                if meta is not None:
+                    m.specialties = tuple(meta.get("specialties") or ())
+                    m.profile = str(meta.get("profile") or "")
+                    m.can_manage = bool(meta.get("can_manage", False))
+                elif m.name in exported.values() or m.name.startswith("celestial-"):
                     m.can_manage = False
             self._models = found
         return self._models
@@ -622,15 +697,16 @@ class Celestial:
         def score(m: ModelInfo) -> float:
             n, mean = stats.get(m.name, (0, 0.0))
             prior = priors.get(m.name, {}).get(role_name)  # (正解率, 平均秒, 課題数)
+            spec_bonus = 0.08 if role_name in m.specialties else 0.0
             if prior is not None:
                 accuracy, latency, count = prior
                 weight = min(count, 5)
                 prior_reward = accuracy - 0.3 * min(1.0, latency / 60.0)
                 blended = (n * mean + weight * prior_reward) / (n + weight)
-                return blended + self.cfg.explore * math.sqrt(math.log(total + weight + 1) / (n + weight)) - swap_cost(m)
+                return blended + spec_bonus + self.cfg.explore * math.sqrt(math.log(total + weight + 1) / (n + weight)) - swap_cost(m)
             if n == 0:
-                return 0.8 - 0.15 * abs(TIERS.index(m.tier) - want) - swap_cost(m)
-            return mean + self.cfg.explore * math.sqrt(math.log(total + 1) / n) - swap_cost(m)
+                return 0.8 + spec_bonus - 0.15 * abs(TIERS.index(m.tier) - want) - swap_cost(m)
+            return mean + spec_bonus + self.cfg.explore * math.sqrt(math.log(total + 1) / n) - swap_cost(m)
 
         return max(models, key=score)
 
@@ -641,8 +717,11 @@ class Celestial:
             history: list[tuple[str, str]] | None = None, learn: bool = True,
             on_stage: OnStage | None = None, tools: bool = False, agent: bool = False,
             approve: Callable[[dict], bool] | None = None, images: list[bytes] | None = None,
-            folder: str | None = None) -> Result:
+            folder: str | None = None, sandbox: bool = False) -> Result:
         """タスクを1件処理する。
+
+        sandbox=True(計測用)では、エージェントは作業フォルダの中のファイルとコマンドだけを使う(利用者の設定の権限に
+        よらず、PC の操作・ネット・作業フォルダの外は使わない)。
 
         role/model を指定すると振り分け・モデル選択を固定できる。swarm は None=自動, True=必ず分解, False=分解しない。
         history は直近の (ユーザー発話, 回答) の列(対話モード用)。
@@ -681,6 +760,11 @@ class Celestial:
                     return Result(0, reply, "reason", "計算", "calc", "calc", 0, time.perf_counter() - t0)
 
         tools = tools or agent
+        if (not tools and not images and role is None and forced_model is None and learn and swarm is not True
+                and self.agent_mode() != "read" and (self.cfg.tools_write or self.cfg.tools_run or self.agent_mode() == "full")
+                and needs_agent(task)):
+            tools = True  # ファイル・フォルダ・コマンドの依頼は、切り替えなくてもエージェントが自動で引き受ける
+            _emit(on_stage, "auto_agent")
         plain = role is None and forced_model is None and not history and swarm is not True and not tools and not images
         if plain and learn and use_cache and self.cfg.cache and not time_sensitive(task):
             hit = self.store.cache_lookup(task, after_id=self._personal_epoch)
@@ -707,13 +791,14 @@ class Celestial:
             return self._run_swarm(task, route_source, usage, t0, verify, on_token, learn, on_stage)
         if tools:
             # 「〜アプリを作って」は、計画してファイルごとに書き、確かめて直す手順で作る(1回の応答で全部を書かせない)
-            if (not images and forced_model is None and project.looks_like_project_request(task) and self.cfg.tools_write
-                    and self.work_folder(folder) is not None):
+            # (続きの依頼は、前の作業を受け継ぐエージェントに任せる。新しいプロジェクトを作り始めない)
+            if (not images and forced_model is None and project.looks_like_project_request(task) and not _SMALL_JOB.search(task) and self.cfg.tools_write
+                    and self.work_folder(folder) is not None and not (history and is_continuation(task))):
                 return self._run_project(task, usage=usage, t0=t0, on_token=on_token, on_stage=on_stage, learn=learn,
-                                         approve=approve, folder=folder)
+                                         approve=approve, folder=folder, sandbox=sandbox)
             return self._run_agent(task, role_name, route_source=route_source, usage=usage, t0=t0, model=forced_model,
                                    on_token=on_token, on_stage=on_stage, history=history, learn=learn,
-                                   approve=approve, images=images, folder=folder)
+                                   approve=approve, images=images, folder=folder, sandbox=sandbox)
         return self._solve(task, role_name, route_source=route_source, usage=usage, t0=t0, model=forced_model,
                            verify=verify, on_token=on_token, history=history, learn=learn, on_stage=on_stage,
                            images=images)
@@ -746,9 +831,17 @@ class Celestial:
         japanese = wants_japanese(task, role_name)
         # 計測(learn=False)では利用者の指示を混ぜない(モデルの素の力を比べるため)
         system = role.system + (_JA_HINT if japanese else "") + time_context(task, memories=list(self.cfg.memories) if learn else None) +(self.personal_prompt() if learn else "")
+        system += knowhow.hints(task) if role_name == "code" else knowhow.coding_hints(task)  # キーのいらない公開 API の使い方
         news_sources: list[dict] = []
         if learn and _LIVE.search(task):
             system, news_sources = self._live_context(task, system, on_stage)
+        kb_sources: list[dict] = []
+        if learn and self.cfg.use_kb and role_name in ("general", "write", "reason", "summarize") and self.kb.stats()["docs"] > 0:
+            kb_hits = self.kb.search(task, top_k=3, min_score=0.25)
+            if kb_hits:
+                _emit(on_stage, "kb", hits=len(kb_hits))
+                system += knowledge.context_prompt(kb_hits)
+                kb_sources = [{"title": f"知識: {h['title']}", "url": h["source"]} for h in kb_hits]
         messages: list[Message] = [{"role": "system", "content": system}]
         for ex in examples:  # 過去の成功例を手本として渡す
             messages += [{"role": "user", "content": ex.task[:_CLIP]}, {"role": "assistant", "content": ex.answer[:_CLIP]}]
@@ -767,7 +860,7 @@ class Celestial:
         gen, chosen, confidence, escalated, sources = self._answer(
             task, role_name, messages, chosen, forced=model is not None, japanese=japanese, history=bool(history),
             on_token=on_token, on_stage=on_stage, images=images, learn=learn, route_source=route_source, parent_id=parent_id)
-        sources = news_sources + list(sources)
+        sources = kb_sources + news_sources + list(sources)
         verified = 0
         if verify:
             _emit(on_stage, "verify")
@@ -1023,31 +1116,116 @@ class Celestial:
 
     # ---- ツール実行 ---------------------------------------------------------
 
-    def work_folder(self, folder: str | None) -> Path | None:
-        """エージェントが作業するフォルダ: 作業フォルダ、またはその中のフォルダ(会話ごとに選べる)。外は選べない。"""
-        workspace = Path(self.cfg.workspace) if self.cfg.workspace else None
-        if workspace is None or not workspace.is_dir():
+    @staticmethod
+    def default_workspace() -> Path:
+        """作業フォルダを設定していないときに使うフォルダ(エージェントが作ったものはここに置く)。"""
+        return Path.home() / "Celestial"
+
+    def workspace_root(self) -> Path | None:
+        """作業フォルダ。設定が空なら既定のフォルダ(無ければ作る)。設定したフォルダが無いときは None。"""
+        if self.cfg.workspace:
+            folder = Path(self.cfg.workspace)
+            return folder if folder.is_dir() else None
+        folder = self.default_workspace()
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+        except OSError:
             return None
-        if not folder or folder.strip() in (".", ""):
+        return folder
+
+    def agent_mode(self) -> str:
+        """権限のモード。古い設定の「確認する(confirm = true)」だけがあれば「確認しながら」とみなす。"""
+        mode = self.cfg.agent_mode if self.cfg.agent_mode in AGENT_MODES else "auto"
+        return "ask" if mode == "auto" and self.cfg.tools_confirm else mode
+
+    @staticmethod
+    def is_system_folder(path: Path) -> bool:
+        return bool(_SYSTEM_FOLDER.match(str(path)))
+
+    def work_folder(self, folder: str | None) -> Path | None:
+        """エージェントが作業するフォルダ。会話ごとに、PC の好きなフォルダを選べる(絶対パス)。
+        相対パスは作業フォルダからの位置。Windows やプログラムの置き場は、権限が「すべて許可」のときだけ選べる。"""
+        workspace = self.workspace_root()
+        raw = (folder or "").strip().strip('"')
+        if not raw or raw == ".":
             return workspace
-        root = workspace.resolve()
-        target = (root / folder.strip()).resolve()
-        if target != root and root not in target.parents:
-            raise ValueError("作業するフォルダは、作業フォルダの中から選んでください")
+        candidate = Path(os.path.expandvars(raw)).expanduser()
+        if candidate.is_absolute():
+            target = candidate.resolve()
+        else:
+            if workspace is None:
+                raise ValueError("作業フォルダが設定されていません")
+            root = workspace.resolve()
+            target = (root / raw).resolve()
+            if target != root and root not in target.parents and self.agent_mode() != "full":
+                # 「../」のような相対の位置で外へ出るのは、取り違えのもとなので断る(外のフォルダは絶対パスで選ぶ)
+                raise ValueError("相対の位置で作業フォルダの外は選べません。フォルダを選ぶ画面か、C:\\… のような絶対パスで選んでください")
         if not target.is_dir():
             raise ValueError(f"フォルダが見つかりません: {folder}")
+        if self.is_system_folder(target) and self.agent_mode() != "full":
+            raise ValueError("ドライブ全体や Windows・プログラムのフォルダは、権限が「すべて許可」のときだけ選べます")
         return target
 
-    def tool_context(self, approve: Callable[[dict], bool] | None = None, folder: str | None = None) -> ToolContext:
+    def remember_folder(self, path: Path) -> None:
+        """エージェントに作業させたフォルダを、選ぶときの候補として覚える(新しいものを先頭に)。"""
+        text = str(path)
+        recent = [text] + [f for f in self.cfg.recent_folders if f != text]
+        if recent != list(self.cfg.recent_folders):
+            self.cfg.recent_folders = recent[:MAX_RECENT_FOLDERS]
+            self.store.set_setting("recent_folders", self.cfg.recent_folders)
+
+    def tool_context(self, approve: Callable[[dict], bool] | None = None, folder: str | None = None,
+                     sandbox: bool = False) -> ToolContext:
+        """権限のモードと、許可した道具から、エージェントの道具の使い方を決める。
+
+        sandbox=True(計測用)は、作業フォルダの中のファイルとコマンドだけ。利用者の設定によらず、PC の操作(画面を撮る・
+        キーを打つ など)・ネット・作業フォルダの外は使わない(計測の課題に要らず、利用者の画面を乱すことがあるため)。
+        """
         workspace = self.work_folder(folder)
         if workspace is not None and not workspace.is_dir():
             workspace = None
+        if sandbox:
+            return ToolContext(workspace=workspace, allow_write=True, allow_run=True, backup_dir=self.cfg.home / "backups",
+                               confirm=False, guard=True, anywhere=False, approve=approve, delegate=self._delegate,
+                               scratch_dir=self.cfg.home / "scratch", changes={})
+        mode = self.agent_mode()
+        full = mode == "full"
         return ToolContext(
-            workspace=workspace, allow_write=self.cfg.tools_write, allow_run=self.cfg.tools_run,
-            allow_pc=self.cfg.tools_pc, allow_net=self.cfg.tools_net, backup_dir=self.cfg.home / "backups",
-            confirm=self.cfg.tools_confirm, approve=approve,
+            workspace=workspace,
+            allow_write=mode != "read" and (full or self.cfg.tools_write),
+            allow_run=mode != "read" and (full or self.cfg.tools_run),
+            allow_pc=full or self.cfg.tools_pc, allow_net=full or self.cfg.tools_net,
+            backup_dir=self.cfg.home / "backups",
+            confirm=mode == "ask", confirm_commands=mode == "edit", guard=not full, anywhere=full, approve=approve,
             describe_image=self._describe_image if self._vision_model() else None,
-            delegate=self._delegate, scratch_dir=self.cfg.home / "scratch", changes={})
+            delegate=self._delegate, scratch_dir=self.cfg.home / "scratch", changes={},
+            kb=self.kb, memorize=self._memorize_tool)
+
+    def _memorize_tool(self, action: str, fact: str = "") -> str:
+        act = (action or "").strip().lower()
+        clean = re.sub(r"\s+", " ", (fact or "")).strip()[:MAX_MEMORY_CHARS]
+        with self._personal_lock:
+            memories = list(self.cfg.memories)
+            if act == "list":
+                return "覚えていること:\n" + "\n".join(f"- {m}" for m in memories) if memories else "(覚えていることはありません)"
+            if act == "remember":
+                if not clean:
+                    raise ToolError("覚える内容(fact)を指定してください")
+                if clean in memories:
+                    return f"もう覚えています: {clean}"
+                if len(memories) >= MAX_MEMORIES:
+                    raise ToolError(f"覚えていることが上限({MAX_MEMORIES}件)に達しています")
+                self.set_setting("memories", memories + [clean])
+                return f"覚えました: {clean}"
+            if act == "forget":
+                if not clean:
+                    raise ToolError("忘れる内容(fact)を指定してください")
+                kept = [m for m in memories if clean not in m and m not in clean]
+                if len(kept) == len(memories):
+                    return f"「{clean}」は記憶にありませんでした"
+                self.set_setting("memories", kept)
+                return f"忘れました({len(memories) - len(kept)}件)"
+        raise ToolError("action は remember / forget / list のいずれかを指定してください")
 
     def bench_priors(self) -> dict[str, dict[str, tuple[float, float, int]]]:
         """精度の計測結果(今の組み込みの課題集で測ったものを優先)。{モデル名: {役割: (正解率, 平均秒, 課題数)}}"""
@@ -1098,30 +1276,45 @@ class Celestial:
         return f"[{result.role} 担当 / {result.model}]\n{result.text}"
 
     def _pick_agent_model(self, role_name: str) -> ModelInfo:
-        """エージェントは手順を誤りにくいことが大事なので、計測で正確なモデルを使う(未計測なら大きいモデル)。
+        """エージェントのAIを選ぶ。
 
-        コードの仕事では、同じ成績ならコード向けのモデルを優先する。
+        1) エージェントの計測(実際にファイルやコマンドの作業をさせた成功率。直近3回を合わせる)が高いもの。同じくらいなら速いもの
+        2) 未計測なら、回答の計測でその種類の正確さが高いもの。同じくらいなら、この PC で速いもの
+           (VRAM に収まらない大きいモデルは1手ごとに遅く、エージェントでは何十回も呼ぶため)
         """
+        chosen = self.cfg.agent_model
+        if chosen and chosen != "auto":
+            fixed = next((m for m in self.models() if m.name == chosen), None)
+            if fixed is not None:  # 設定で選んだAIを使う
+                return fixed
         candidates = [m for m in self.models() if m.can_manage] or self.models()
         scores = self._bench_scores()
+        agent = self.store.agent_priors()
+        priors = self.bench_priors()
 
         def rank(m: ModelInfo) -> tuple:
             mine = scores.get(m.name, {})
-            coder = role_name == "code" and "code" in m.name.lower()
-            return (mine.get(role_name, mine.get("all", -1.0)), coder, mine.get("all", -1.0), m.size_bytes)
+            measured = agent.get(m.name)
+            success = round(measured[0], 1) if measured else -1.0       # 1割の差までは同じくらいとみなす
+            agent_speed = -measured[1] if measured else 0.0
+            accuracy = round(mine.get(role_name, mine.get("all", -1.0)), 1)
+            seconds = priors.get(m.name, {}).get(role_name, (0, 0.0, 0))[1]
+            spec = ("agent" in m.specialties) or (role_name in m.specialties) or (role_name == "code" and "code" in m.name.lower())
+            return (success, agent_speed, accuracy, -round(seconds, 0), mine.get("all", -1.0), spec, m.size_bytes)
 
         return max(candidates, key=rank)
 
     def _run_project(self, task: str, *, usage: _Usage, t0: float, on_token: OnToken | None, on_stage: OnStage | None,
-                     learn: bool, approve: Callable[[dict], bool] | None, folder: str | None) -> Result:
+                     learn: bool, approve: Callable[[dict], bool] | None, folder: str | None, sandbox: bool = False) -> Result:
         """新しいプロジェクトを作る(計画 → ファイルごとに書く → 確かめる → 直す。実体は project.py)。"""
-        ctx = self.tool_context(approve, folder)
+        ctx = self.tool_context(approve, folder, sandbox=sandbox)
         model = self._pick_agent_model("code")
         _emit(on_stage, "worker", role="code", model=model.name, examples=0, agent=True)
         personal = self.personal_prompt() if learn else ""
+        facts = knowhow.hints(task)  # 天気など、キーのいらない公開 API の使い方
 
         def plan_fn(request: str) -> dict:
-            gen = self._generate(model, [{"role": "system", "content": project.PLAN_SYSTEM + personal}, {"role": "user", "content": request}],
+            gen = self._generate(model, [{"role": "system", "content": project.PLAN_SYSTEM + facts + personal}, {"role": "user", "content": request}],
                                  temperature=0.1, max_tokens=1500, json_schema=project.PLAN_SCHEMA)
             usage.add(gen)
             try:
@@ -1130,7 +1323,7 @@ class Celestial:
                 raise ValueError("プロジェクトの計画を作れませんでした。もう一度試すか、言い方を変えてください") from e
 
         def write_fn(prompt: str) -> str:
-            gen = self._generate(model, [{"role": "system", "content": project.FILE_SYSTEM + personal}, {"role": "user", "content": prompt}],
+            gen = self._generate(model, [{"role": "system", "content": project.FILE_SYSTEM + facts + personal}, {"role": "user", "content": prompt}],
                                  temperature=0.2, max_tokens=4000)
             usage.add(gen)
             return gen.text
@@ -1150,19 +1343,21 @@ class Celestial:
     def _run_agent(self, task: str, role_name: str, *, route_source: str, usage: _Usage, t0: float, model: ModelInfo | None,
                    on_token: OnToken | None, on_stage: OnStage | None, history: list[tuple[str, str]] | None,
                    learn: bool, approve: Callable[[dict], bool] | None = None, images: list[bytes] | None = None,
-                   folder: str | None = None) -> Result:
+                   folder: str | None = None, sandbox: bool = False) -> Result:
         """AIエージェントとして動かす(実体は agent.py)。"""
-        ctx = self.tool_context(approve, folder)
+        ctx = self.tool_context(approve, folder, sandbox=sandbox)
         chosen = model or self._pick_agent_model(role_name)
         _emit(on_stage, "worker", role=role_name, model=chosen.name, examples=0, agent=True)
-        goal = task
+        personal = self.personal_prompt() if learn else ""
+        goal = with_earlier_requests(task, history)  # 「続きから作成して」でも、元の目的が分かるように
+        ctx.write_code = lambda path, instructions, current: self._write_code(chosen, goal, path, instructions, current, ctx, usage, personal)
         if images:  # 画像は先に文章にしてから渡す(エージェント役のモデルが画像を扱えなくてもよいように)
             notes = [self._describe_image_bytes(image) for image in images]
             goal += "\n\n[添付画像の内容]\n" + "\n---\n".join(notes)
         out = run_agent(task=goal, role_name=role_name, model=chosen, ctx=ctx, max_steps=self.cfg.tools_max_steps,
                         generate=self._generate, history=history, on_token=on_token,
                         on_event=lambda kind, **data: _emit(on_stage, kind, **data),
-                        personal=time_context(task, memories=list(self.cfg.memories) if learn else None) +(self.personal_prompt() if learn else ""))
+                        personal=time_context(task, memories=list(self.cfg.memories) if learn else None) + personal)
         usage.tokens += out["tokens"]
         latency = time.perf_counter() - t0
         new_id = 0
@@ -1171,7 +1366,106 @@ class Celestial:
                                     route_source=route_source, overhead_tokens=usage.tokens, latency_s=latency,
                                     gen_latency_s=out["gen_latency"])
         return Result(new_id, out["answer"], role_name, chosen.name, "agent", route_source, usage.tokens, latency,
-                      tool_calls=out["calls"], changes=summarize_changes(ctx))
+                      tool_calls=out["calls"], changes=summarize_changes(ctx), plan=out.get("plan") or [])
+
+    def _write_code(self, model: ModelInfo, task: str, path: str, instructions: str, current: str | None, ctx: ToolContext,
+                    usage: _Usage, personal: str) -> str:
+        """エージェントの write_code: ファイル1つの中身だけを書かせる(全体の依頼・フォルダの構成・関係するファイルを見せる)。"""
+        parts = [f"Overall task: {task}", f"File to write: {path}", f"What it must contain: {instructions}"]
+        try:
+            parts.append("Files in the workspace:\n" + toolbox.tree(ctx, ".", depth=3, limit=80))
+        except ToolError:
+            pass
+        for rel, text in self._related_files(ctx, path, instructions):
+            parts.append(f"=== {rel} ===\n{text}")
+        if current is not None:
+            parts.append(f"Current content of {path} (write the whole new version; keep what should stay):\n{current[:12000]}")
+        if path.lower().endswith((".md", ".txt")):
+            parts.append("Describe only what exists in the workspace. Do not invent URLs, files or dependencies.")
+        parts.append(f"Write the complete content of {path}.")
+        facts = knowhow.hints(f"{task}\n{path}\n{instructions}")
+        messages = [{"role": "system", "content": project.FILE_SYSTEM + facts + personal}, {"role": "user", "content": "\n\n".join(parts)}]
+        gen = self._generate(model, messages, temperature=0.2, max_tokens=6000)
+        usage.add(gen)
+        content = project.strip_fences(gen.text, path)
+        error = project.syntax_error(path, content)
+        if error:  # 構文の誤りは、エージェントに渡す前に1回だけ書き直させる
+            ask = (f"This file has an error: {error}\nWrite the complete corrected content of {path}. Output only the file "
+                   "content, no explanations, no code fences.")
+            if path.lower().endswith((".py", ".pyw")) and markup_in_python(content):
+                # Python のファイルに HTML のページを書いた: 直すのではなく、Python として書き直させる(実際にあった)
+                ask = (f"You wrote an HTML page, but {path} is a Python file: it must contain only Python code. Write the "
+                       f"Python code of {path} instead"
+                       + (" (the Flask app: app = Flask(__name__), the routes, and return the page with "
+                          "render_template('index.html', ...); the page itself is the file templates/index.html, written "
+                          "in another step)" if re.search(r"flask", f"{task}\n{instructions}", re.I) else "")
+                       + ". Output only the Python code, no explanations, no code fences.")
+                retry = messages + [{"role": "assistant", "content": content[:4000]}, {"role": "user", "content": ask}]
+            else:
+                retry = messages + [{"role": "assistant", "content": content}, {"role": "user", "content": ask}]
+            try:
+                gen = self._generate(model, retry, temperature=0.1, max_tokens=6000)
+                usage.add(gen)
+                fixed = project.strip_fences(gen.text, path)
+                if not project.syntax_error(path, fixed):
+                    content = fixed
+            except BackendError:
+                pass
+        return content
+
+    @staticmethod
+    def _related_files(ctx: ToolContext, path: str, instructions: str, limit: int = 4) -> list[tuple[str, str]]:
+        """書くファイルと関係しそうな、作業フォルダの中の小さい文字のファイル。
+
+        同じフォルダ・指示に名前が出てくるもの・一つ上のフォルダのコード(templates/index.html を書くなら、横の app.py)・
+        templates や static の中の画面(app.py を書くなら、それが返す画面)。画面とサーバーの受け渡しを食い違わせないため。
+        """
+        root = ctx.workspace.resolve() if ctx.workspace else None
+        if root is None:
+            return []
+        target = (root / path).resolve()
+        names = set(re.findall(r"[\w./-]+\.(?:py|js|ts|html|css|json|md|txt|toml|yaml|yml|csv)\b", instructions))
+        picked: list[tuple[str, str]] = []
+        folder = target.parent
+        candidates = sorted(folder.glob("*")) if folder.is_dir() else []
+        candidates += [root / n for n in names]
+        if folder != root and root in folder.parents:
+            candidates += sorted(p for p in folder.parent.glob("*") if p.suffix.lower() in (".py", ".js", ".ts"))
+        for sub in ("templates", "static", "public"):
+            if (folder / sub).is_dir():
+                candidates += sorted((folder / sub).glob("*.*"))
+        seen = set()
+        for file in candidates:
+            try:
+                file = file.resolve()
+            except OSError:
+                continue
+            if file in seen or file == target or not file.is_file() or root not in file.parents:
+                continue
+            seen.add(file)
+            if file.suffix.lower() not in (".py", ".js", ".ts", ".html", ".css", ".json", ".md", ".txt", ".toml", ".yaml", ".yml", ".csv"):
+                continue
+            try:
+                data = file.read_bytes()
+            except OSError:
+                continue
+            if len(data) > 8000 or b"\x00" in data:
+                continue
+            picked.append((file.relative_to(root).as_posix(), data.decode("utf-8", "replace")))
+            if len(picked) >= limit:
+                break
+        return picked
+
+    def see(self, image: bytes, mode: str = "describe", question: str = "", lang: str = "ja") -> dict:
+        """画像を読み取る(カメラの映像・PC の画面・写真)。戻り値は {mode, text, objects?, model, latency_s, tokens}。"""
+        model = self._vision_model()
+        if model is None:
+            raise BackendError("画像を扱えるAIがありません(例: ollama pull gemma3:4b)")
+        messages, spec = vision.prompt(mode, question, lang)
+        t0 = time.perf_counter()
+        gen = self._generate(model, messages, temperature=0.1, max_tokens=spec.max_tokens, images=[image], json_schema=spec.schema)
+        out = vision.parse(mode, gen.text)
+        return {"mode": mode, **out, "model": model.name, "latency_s": round(time.perf_counter() - t0, 2), "tokens": gen.tokens}
 
     def _describe_image_bytes(self, image: bytes) -> str:
         model = self._vision_model()
@@ -1216,8 +1510,8 @@ class Celestial:
             pool = [m for m in known if m in ready] if fast and any(m in ready for m in known) else known
             return max(pool, key=lambda m: (measured[m.name].get("accuracy", 0.0), -measured[m.name].get("ece", 1.0), -m.size_bytes))
         if ready:
-            return min(ready, key=lambda m: m.size_bytes)
-        return min(models, key=lambda m: m.size_bytes) if models else self.manager_model()
+            return min(ready, key=lambda m: (-int("judge" in m.specialties or m.profile == "judge"), m.size_bytes))
+        return min(models, key=lambda m: (-int("judge" in m.specialties or m.profile == "judge"), m.size_bytes)) if models else self.manager_model()
 
     def decision_temperature(self, model_name: str) -> float:
         entry = self.decision_calibration().get(model_name) or {}
@@ -1385,6 +1679,17 @@ class Celestial:
             if not folder.is_dir():
                 raise ValueError(f"フォルダが見つかりません: {value}")
             value = str(folder.resolve())
+        if key == "agent_mode" and value not in AGENT_MODES:
+            raise ValueError(f"権限のモードは {', '.join(AGENT_MODES)} のどれかです")
+        if key == "agent_mode" and self.cfg.tools_confirm != (value == "ask"):
+            self.cfg.tools_confirm = value == "ask"  # 古い「確認する」の設定も合わせる(モードと食い違わないように)
+            self.store.set_setting("tools_confirm", self.cfg.tools_confirm)
+        if key == "agent_model" and value != "auto" and value not in [m.name for m in self.models()]:
+            raise ValueError(f"未知のモデル: {value}")
+        if key == "tools_max_steps" and not 5 <= value <= 200:
+            raise ValueError("手数の上限は 5〜200 で指定してください")
+        if key == "recent_folders":
+            value = [str(v) for v in value if isinstance(v, str) and v.strip()][:MAX_RECENT_FOLDERS]
         if key == "fewshot_k" and not 0 <= value <= 8:
             raise ValueError("手本の件数は 0〜8 で指定してください")
         if key == "manager_model" and value != "auto" and value not in [m.name for m in self.models()]:

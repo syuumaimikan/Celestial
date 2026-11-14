@@ -1,11 +1,129 @@
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:path_provider/path_provider.dart';
 
 import '../app_state.dart';
 import '../net/pc_client.dart';
 import '../platform.dart';
 import '../theme.dart';
 import 'common.dart';
+import 'models_page.dart';
+
+/// この端末のアプリの版。PC に新しい版が置かれていれば、その場で受け取って入れ替えられる
+/// (PC で `celestial publish-app` を実行すると置かれる)。
+class _AppUpdate extends StatefulWidget {
+  const _AppUpdate();
+
+  @override
+  State<_AppUpdate> createState() => _AppUpdateState();
+}
+
+class _AppUpdateState extends State<_AppUpdate> {
+  Map<String, dynamic> _mine = const {};
+  Map<String, dynamic>? _pc;
+  double? _progress;
+  String? _error;
+  bool _checked = false;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    if (_checked) return;
+    _checked = true;
+    _check();
+  }
+
+  Future<void> _check() async {
+    final state = AppScope.read(context);
+    final mine = await PlatformBridge.appVersion();
+    Map<String, dynamic>? pc;
+    final client = state.client;
+    if (!state.isDesktop && state.online && client != null) {
+      try {
+        pc = await client.getJson('/api/app', timeout: const Duration(seconds: 8));
+      } catch (_) {
+        pc = null; // 版を返さない古い PC 側
+      }
+    }
+    if (mounted) {
+      setState(() {
+        _mine = mine;
+        _pc = pc;
+      });
+    }
+  }
+
+  /// 端末の種類ごとに分けた APK は、版の番号に 1000×種類 が足されている。
+  int get _myBuild => ((_mine['code'] as num?)?.toInt() ?? 0) % 1000;
+  int get _pcBuild => (_pc?['build'] as num?)?.toInt() ?? 0;
+  bool get _newer => _pc?['available'] == true && _myBuild > 0 && _pcBuild > _myBuild;
+
+  Future<void> _update() async {
+    final state = AppScope.read(context);
+    final client = state.client;
+    if (client == null) return;
+    setState(() {
+      _progress = 0;
+      _error = null;
+    });
+    try {
+      final dir = Directory('${(await getTemporaryDirectory()).path}/updates');
+      await dir.create(recursive: true);
+      final file = File('${dir.path}/celestial.apk');
+      await client.download('/app/celestial.apk', const {}, file, onProgress: (got, total) {
+        if (mounted && total > 0) setState(() => _progress = got / total);
+      });
+      final how = await PlatformBridge.installApk(file.path);
+      if (how == 'permission') state.toast('「この提供元のアプリを許可」をオンにして戻り、もう一度「更新する」を押してください');
+    } on PcException catch (e) {
+      if (mounted) setState(() => _error = e.message);
+    } catch (e) {
+      if (mounted) setState(() => _error = '更新できませんでした: $e');
+    } finally {
+      if (mounted) setState(() => _progress = null);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final p = context.palette;
+    final name = (_mine['name'] as String?) ?? kAppVersion;
+    final size = ((_pc?['size'] as num?) ?? 0) / 1e6;
+    return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      Text('Celestial $name', style: const TextStyle(fontWeight: FontWeight.w600)),
+      if (_newer) ...[
+        const SizedBox(height: 10),
+        Container(
+          padding: const EdgeInsets.fromLTRB(14, 12, 12, 12),
+          decoration: BoxDecoration(color: p.accentSoft, borderRadius: BorderRadius.circular(14)),
+          child: Row(children: [
+            Icon(Icons.system_update_alt, color: context.colors.primary),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Text('新しい版 ${_pc!['version']} が PC にあります', style: const TextStyle(fontWeight: FontWeight.w600)),
+                const SizedBox(height: 2),
+                Text(
+                    _progress == null
+                        ? '${size.toStringAsFixed(0)}MB。受け取ると、入れ替えの確認が出ます'
+                        : '受け取り中 ${(_progress! * 100).toStringAsFixed(0)}%',
+                    style: TextStyle(color: p.muted, fontSize: 12.5)),
+                if (_progress != null)
+                  Padding(padding: const EdgeInsets.only(top: 6), child: LinearProgressIndicator(value: _progress)),
+              ]),
+            ),
+            const SizedBox(width: 8),
+            FilledButton(onPressed: _progress == null ? _update : null, child: const Text('更新する')),
+          ]),
+        ),
+      ],
+      if (_error != null)
+        Padding(padding: const EdgeInsets.only(top: 6), child: Text(_error!, style: TextStyle(color: p.bad, fontSize: 12.5))),
+    ]);
+  }
+}
 
 /// PC との接続(QR コードのリンクや、アドレスとコードの入力)。
 Future<void> showPairSheet(BuildContext context, {String host = '', int port = 8765, String code = ''}) {
@@ -111,6 +229,24 @@ class _SettingsPageState extends State<SettingsPage> {
     return Scaffold(
       appBar: AppBar(title: const Text('設定')),
       body: ListView(padding: const EdgeInsets.fromLTRB(14, 4, 14, 28), children: [
+        if (!state.isDesktop)
+          Card(
+            child: ListTile(
+              contentPadding: const EdgeInsets.fromLTRB(16, 6, 12, 6),
+              leading: Container(
+                width: 40,
+                height: 40,
+                decoration: BoxDecoration(color: p.accentSoft, borderRadius: BorderRadius.circular(12)),
+                child: Icon(Icons.memory, color: context.colors.primary),
+              ),
+              title: const Text('AIモデル'),
+              subtitle: Text(
+                  state.settings.localModel.isEmpty ? '端末内のAIを PC から受け取る' : '使用中: ${state.settings.localModel}',
+                  style: TextStyle(color: p.muted, fontSize: 12.5)),
+              trailing: const Icon(Icons.chevron_right),
+              onTap: () => Navigator.of(context).push(MaterialPageRoute(builder: (_) => const ModelsPage(active: true))),
+            ),
+          ),
         SectionCard(
           title: 'PC との接続',
           trailing: const LinkBadge(),
@@ -234,7 +370,7 @@ class _SettingsPageState extends State<SettingsPage> {
         SectionCard(
           title: 'このアプリについて',
           child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Text('Celestial 0.2.0', style: const TextStyle(fontWeight: FontWeight.w600)),
+            const _AppUpdate(),
             const SizedBox(height: 4),
             Text('小型AI群と管理AIによる、使うほど進化するローカルAI。会話・ファイル・操作の通信は Tailscale の中だけを通ります。', style: TextStyle(color: p.muted, height: 1.5)),
             const SizedBox(height: 8),

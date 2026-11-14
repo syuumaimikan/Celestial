@@ -221,8 +221,12 @@ class ChatStore:
             rows = self._db.execute(sql, (conversation_id,)).fetchall()
         return [_message(r) for r in rows]
 
-    def history_pairs(self, conversation_id: str, *, before: str | None = None, turns: int = 3) -> list[tuple[str, str]]:
-        """直近の (ユーザーの発言, 回答) の組。before を指定したら、そのメッセージより前だけ。"""
+    def history_pairs(self, conversation_id: str, *, before: str | None = None, turns: int = 3,
+                      keep_first: bool = False) -> list[tuple[str, str]]:
+        """直近の (ユーザーの発言, 回答) の組。before を指定したら、そのメッセージより前だけ。
+
+        keep_first なら、会話の最初の組(元の目的が書かれていることが多い)も、古くても先頭に残す。
+        """
         pairs, pending = [], None
         for m in self.messages(conversation_id):
             if m["id"] == before:
@@ -232,6 +236,8 @@ class ChatStore:
             elif m["role"] == "assistant" and pending is not None and m["content"].strip():
                 pairs.append((pending, m["content"]))
                 pending = None
+        if keep_first and len(pairs) > turns:
+            return [pairs[0]] + pairs[-turns:]
         return pairs[-turns:]
 
     # ---- 同期 ----

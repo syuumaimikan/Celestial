@@ -23,6 +23,7 @@ import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.view.WindowManager
+import androidx.core.content.FileProvider
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.EventChannel
@@ -59,6 +60,8 @@ class MainActivity : FlutterActivity() {
                     }
                     "deviceName" -> result.success(deviceName())
                     "deviceInfo" -> result.success(deviceInfo())
+                    "appVersion" -> result.success(appVersion())
+                    "installApk" -> result.success(installApk(call.argument<String>("path")!!))
                     "pickFile" -> pickFile(result)
                     "saveToDownloads" -> result.success(saveToDownloads(call.argument<String>("path")!!, call.argument<String>("name")!!))
                     "notify" -> {
@@ -159,6 +162,29 @@ class MainActivity : FlutterActivity() {
             "available_memory" to memory.availMem,
             "abis" to Build.SUPPORTED_ABIS.toList(),
         )
+    }
+
+    // ---- アプリの更新(PC から受け取った新しい版を、Android の入れ替えの確認画面に渡す) ----
+
+    private fun appVersion(): HashMap<String, Any?> {
+        @Suppress("DEPRECATION")
+        val info = packageManager.getPackageInfo(packageName, 0)
+        @Suppress("DEPRECATION")
+        val code = if (Build.VERSION.SDK_INT >= 28) info.longVersionCode else info.versionCode.toLong()
+        return hashMapOf("name" to info.versionName, "code" to code)
+    }
+
+    /** 入れる許可がまだ無ければ、その設定の画面を開いて "permission" を返す。確認画面を出せたら "started"。 */
+    private fun installApk(path: String): String {
+        if (Build.VERSION.SDK_INT >= 26 && !packageManager.canRequestPackageInstalls()) {
+            startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:$packageName"))
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+            return "permission"
+        }
+        val uri = FileProvider.getUriForFile(this, "$packageName.files", File(path))
+        startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(uri, "application/vnd.android.package-archive")
+            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK))
+        return "started"
     }
 
     // ---- ファイルの選択(選んだファイルは一時フォルダに写して、その場所を返す) ----

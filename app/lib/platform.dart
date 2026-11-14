@@ -7,6 +7,9 @@ import 'package:flutter/services.dart';
 
 import 'core/models.dart';
 
+/// アプリの版(pubspec.yaml の version と同じにする。Android 以外で使う)。
+const kAppVersion = '0.3.0';
+
 class PickedFile {
   PickedFile(this.path, this.name, this.size);
   final String path;
@@ -205,6 +208,18 @@ class PlatformBridge {
   static Future<void> keepScreenOn(bool on) async {
     if (!_android) return;
     await _channel.invokeMethod('keepScreenOn', {'on': on});
+  }
+
+  /// この端末に入っているアプリの版 {name, code}(code は端末の種類ごとに 1000×種類 が足されていることがある)。
+  static Future<Map<String, dynamic>> appVersion() async {
+    if (!_android) return {'name': kAppVersion, 'code': 0};
+    return await _channel.invokeMapMethod<String, dynamic>('appVersion') ?? {'name': kAppVersion, 'code': 0};
+  }
+
+  /// 受け取った APK を入れ替える。入れる許可がまだ無ければ設定の画面を開いて 'permission' を返す。
+  static Future<String> installApk(String path) async {
+    if (!_android) return 'unsupported';
+    return await _channel.invokeMethod<String>('installApk', {'path': path}) ?? '';
   }
 
   static Future<Map<String, dynamic>> deviceInfo() async {

@@ -1,7 +1,7 @@
 name: celestial
 description: "Celestial: 小型AI群と管理AIによる、使うほど進化するローカルAI(スマホ・PC 用アプリ)"
 publish_to: 'none'
-version: 0.2.0+2
+version: 0.3.0+3
 
 environment:
   sdk: ^3.13.3
@@ -14,6 +14,13 @@ dependencies:
   path_provider: ^2.1.5
   celestial_llm:
     path: packages/celestial_llm
+  camera: ^0.12.2
+  google_mlkit_text_recognition: ^1.0.3
+  google_mlkit_object_detection: ^1.0.3
+  google_mlkit_image_labeling: ^1.0.3
+  google_mlkit_barcode_scanning: ^1.0.3
+  google_mlkit_face_detection: ^1.0.3
+  google_mlkit_translation: ^1.0.3
 
 dev_dependencies:
   flutter_test:

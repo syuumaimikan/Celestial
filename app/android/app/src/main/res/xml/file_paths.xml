@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- PC から受け取った新しい版のアプリ(一時フォルダの updates)だけを、Android の入れ替えの画面に見せる -->
+<paths>
+    <cache-path name="updates" path="updates/" />
+</paths>

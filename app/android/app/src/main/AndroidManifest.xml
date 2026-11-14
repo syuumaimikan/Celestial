@@ -4,6 +4,11 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
     <!-- 音声入力(マイクのボタンを押したときだけ使う。文字にするのは、できれば端末の中で) -->
     <uses-permission android:name="android.permission.RECORD_AUDIO"/>
+    <!-- 「見る」のカメラ(映像は端末の中で認識し、外へは送らない) -->
+    <uses-permission android:name="android.permission.CAMERA"/>
+    <uses-feature android:name="android.hardware.camera" android:required="false"/>
+    <!-- アプリの更新(PC から受け取った新しい版を入れる。「更新する」を押したときだけ) -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"/>
 
     <application
         android:label="Celestial"
@@ -44,6 +49,16 @@
         <meta-data
             android:name="flutterEmbedding"
             android:value="2" />
+        <!-- 受け取った新しい版を、Android の入れ替えの画面に渡すため -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.files"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
     </application>
     <queries>
         <intent>

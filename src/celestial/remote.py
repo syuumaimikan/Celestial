@@ -129,6 +129,11 @@ def _tailscale_exe() -> str | None:
     return None
 
 
+def _ingress(peer: dict) -> bool:
+    """Tailscale Funnel の中継(funnel-ingress-node)。自分の端末ではないので、一覧に出さない。"""
+    return "tag:ingress" in (peer.get("Tags") or []) or peer.get("HostName") == "funnel-ingress-node"
+
+
 def tailscale_status(max_age: float = 10.0) -> dict:
     """{state, ips, dns, hostname, peers}。state は Running(接続中)/ NeedsLogin / Stopped / NoState / missing など。"""
     if _cache["value"] is not None and time.time() - _cache["at"] < max_age:
@@ -146,7 +151,7 @@ def tailscale_status(max_age: float = 10.0) -> dict:
                      "dns": (me.get("DNSName") or "").rstrip("."), "hostname": me.get("HostName") or socket.gethostname(),
                      "peers": [{"name": p.get("HostName") or "", "os": p.get("OS") or "", "online": bool(p.get("Online")),
                                 "ip": next((ip for ip in p.get("TailscaleIPs") or [] if ":" not in ip), "")}
-                               for p in (data.get("Peer") or {}).values()]}
+                               for p in (data.get("Peer") or {}).values() if not _ingress(p)]}
         except (OSError, subprocess.TimeoutExpired, ValueError):
             value["state"] = "error"
     if not value["ips"]:  # コマンドが使えなくても、Tailscale のアドレスが付いていれば使う

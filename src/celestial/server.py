@@ -34,14 +34,18 @@ from .backends import BackendError
 from .backends.native import read_models
 from .bench import load_tasks, run_bench
 from .chats import ChatStore
-from .flows import CONDITION_OPS, STEP_TYPES, TRIGGER_TYPES, FlowEngine, FlowStore, build_flow
-from .manager import TUNABLE, Celestial, Result
+from .flows import CONDITION_OPS, FLOW_TEMPLATES, STEP_TYPES, TRIGGER_TYPES, FlowEngine, FlowStore, build_flow
+from .manager import AGENT_MODES, TUNABLE, Celestial, Result
+from . import tools as toolbox
 from .qr import qr_svg
 from .remote import Devices, is_tailnet, tailscale_status
 from .runs import EventBus, RunManager
-from .study import run_study
+from .study import review_study, run_study, weak_roles
 from .tools import ToolError
-from .train import INSTALL_HINT, TrainConfig, finish_model, libraries_available, train, training_examples
+from . import vision
+from .train import (INSTALL_HINT, MODEL_PRESETS, OWN_PROFILES, TrainConfig, TrainError, config_for_profile,
+                    delete_own_model, evolve_own_ai, finish_model, libraries_available, recommended_base,
+                    resolve_base, train, training_examples)
 from .workers import ROLES
 
 WEB_DIR = Path(__file__).parent / "web"
@@ -51,14 +55,16 @@ _TYPES = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=
 _ROLE_LABELS = {"general": "一般", "code": "コード", "reason": "計算・推論", "summarize": "要約",
                 "translate": "翻訳", "write": "文章作成", "extract": "抽出・整形", "complex": "複合"}
 # スマホなど別の端末からは変えられない設定(PC の安全に関わるもの)
-SENSITIVE = {"workspace", "tools_write", "tools_run", "tools_pc", "tools_net", "tools_confirm", "remote_enabled", "remote_control"}
+SENSITIVE = {"workspace", "tools_write", "tools_run", "tools_pc", "tools_net", "tools_confirm", "remote_enabled", "remote_control",
+             "agent_mode", "agent_model", "tools_max_steps", "recent_folders"}
 MAX_UPLOAD = 2 * 1024**3
 
 
 def _result_dict(r: Result) -> dict:
     return {"id": r.id, "text": r.text, "role": r.role, "model": r.model, "source": r.source,
             "route_source": r.route_source, "tokens": r.tokens, "latency_s": r.latency_s,
-            "examples_used": r.examples_used, "tool_calls": [{k: c.get(k) for k in ("name", "label", "detail", "ok")} for c in r.tool_calls],
+            "examples_used": r.examples_used,
+            "tool_calls": [{k: c.get(k) for k in ("name", "label", "detail", "ok", "thought", "step")} for c in r.tool_calls], "plan": r.plan,
             "subresults": [{"role": s.role, "model": s.model, "tokens": s.tokens, "latency_s": s.latency_s} for s in r.subresults],
             "confidence": None if r.confidence is None else round(r.confidence, 4), "escalated": r.escalated, "sources": r.sources,
             "changes": r.changes}
@@ -112,24 +118,33 @@ class BenchJob:
         self.lock = threading.Lock()
         self.state: dict = {"running": False, "done": 0, "total": 0, "label": "", "outcomes": [], "report": None, "error": None}
 
-    def start(self, model: str | None, run_code: bool, verify: bool) -> bool:
+    def start(self, model: str | None, run_code: bool, verify: bool, kind: str = "answers") -> bool:
         with self.lock:
             if self.state["running"]:
                 return False
-            self.state = {"running": True, "done": 0, "total": 0, "label": model or "auto", "outcomes": [], "report": None, "error": None}
-        threading.Thread(target=self._work, args=(model, run_code, verify), daemon=True).start()
+            self.state = {"running": True, "done": 0, "total": 0, "label": model or "auto", "kind": kind, "outcomes": [],
+                          "report": None, "error": None}
+        threading.Thread(target=self._work, args=(model, run_code, verify, kind), daemon=True).start()
         return True
 
-    def _work(self, model, run_code, verify) -> None:
+    def _work(self, model, run_code, verify, kind="answers") -> None:
         def progress(outcome, i, total):
             with self.lock:
                 self.state["done"], self.state["total"] = i, total
                 self.state["outcomes"].append({k: v for k, v in outcome.__dict__.items() if k != "answer"})
 
         try:
-            report = run_bench(self.app, load_tasks(), model=model, run_code=run_code, verify=verify, on_outcome=progress)
-            summary = report.to_dict()
-            del summary["outcomes"]
+            if kind == "agent":
+                from .agentbench import run_agent_bench
+
+                done = run_agent_bench(self.app, model=model, on_outcome=progress)
+                summary = {"label": "agent:" + done.model, "n": done.n, "correct": done.correct, "accuracy": done.accuracy,
+                           "route_n": 0, "route_correct": 0, "avg_tokens": 0, "avg_latency_s": done.avg_latency,
+                           "by_role": {"agent": [done.correct, done.n]}, "skipped": 0}
+            else:
+                report = run_bench(self.app, load_tasks(), model=model, run_code=run_code, verify=verify, on_outcome=progress)
+                summary = report.to_dict()
+                del summary["outcomes"]
             with self.lock:
                 self.state["report"] = summary
         except Exception as e:  # 裏スレッドなので、何が起きても画面に伝える
@@ -199,8 +214,7 @@ class Api:
 
     def files_root(self) -> Path:
         """ファイルのやり取りに使うフォルダ: 作業フォルダ(設定されていれば)か、Celestial の共有フォルダ。"""
-        workspace = self.app.cfg.workspace
-        root = Path(workspace) if workspace and Path(workspace).is_dir() else self.app.cfg.home / "files"
+        root = self.app.workspace_root() or self.app.cfg.home / "files"
         root.mkdir(parents=True, exist_ok=True)
         return root.resolve()
 
@@ -210,6 +224,28 @@ class Api:
             if path.is_file():
                 return path
         return None
+
+    def apk_info(self) -> dict:
+        """PC に置いてあるスマホのアプリの版(スマホのアプリが「新しい版があるか」を確かめ、その場で更新するため)。"""
+        path = self.apk_path()
+        if path is None:
+            return {"available": False}
+        stat = path.stat()
+        meta: dict = {}
+        side = path.with_suffix(".json")  # celestial publish-app が書き添える版
+        if side.is_file():
+            try:
+                meta = json.loads(side.read_text("utf-8"))
+            except ValueError:
+                meta = {}
+        if not meta.get("build"):  # 書き添えが無ければ、作ったあとに版を変えていない限り pubspec.yaml の版
+            pubspec = PROJECT_DIR / "app" / "pubspec.yaml"
+            if pubspec.is_file() and pubspec.stat().st_mtime <= stat.st_mtime:
+                found = re.search(r"^version:\s*([\w.\-]+)\+(\d+)", pubspec.read_text("utf-8"), re.M)
+                if found:
+                    meta = {"version": found.group(1), "build": int(found.group(2))}
+        return {"available": True, "version": str(meta.get("version") or ""), "build": int(meta.get("build") or 0),
+                "size": stat.st_size, "updated": stat.st_mtime, "url": "/app/celestial.apk"}
 
     def phone_models(self) -> list[dict]:
         """スマホに入れられるモデル(Ollama の GGUF ファイル)。"""
@@ -576,14 +612,19 @@ def state(h: Handler, m, q):
         "error": error,
         "roles": [{"name": name, "label": _ROLE_LABELS[name]} for name in ROLES],
         "role_labels": _ROLE_LABELS,
-        "settings": {key: getattr(app.cfg, key) for key in TUNABLE},
+        "settings": {**{key: getattr(app.cfg, key) for key in TUNABLE}, "agent_mode": app.agent_mode()},
         "sensitive": sorted(SENSITIVE),
         "embed_model": app.embedder.model,
         "vision_model": next((x.name for x in models if x.vision), None),
         "pc_supported": pc.SUPPORTED,
         "backup_dir": str(app.cfg.home / "backups"),
         "files_root": str(h.api.files_root()),
+        "workspace_root": str(app.workspace_root() or ""),
+        "default_workspace": str(app.default_workspace()),
+        "agent_modes": [{"id": k, "label": v[0], "description": v[1]} for k, v in AGENT_MODES.items()],
+        "processes": toolbox.running_processes(),
         "apk": h.api.apk_path() is not None,
+        "apk_info": h.api.apk_info(),
         "home": str(app.cfg.home),
         "name": socket.gethostname(),
         "version": __version__,
@@ -681,15 +722,60 @@ def decide_calibrate(h: Handler, m, q):
 @route("GET", r"/api/own")
 def own(h: Handler, m, q):
     app = h.api.app
-    keys = ("name", "base", "created", "examples", "eval_loss", "base_eval_loss", "seconds", "ollama", "adapter")
+    keys = ("name", "base", "tier", "quantize", "profile", "specialties", "can_manage",
+            "created", "examples", "eval_loss", "base_eval_loss", "preference_steps", "seconds", "ollama", "adapter")
+    bench_map: dict[str, dict] = {}
+    for r in app.store.bench_history():
+        bench_map[r["label"]] = {"correct": int(r["correct"]), "n": int(r["n"]), "suite": r["suite"]}
+    models = []
+    for x in read_models(app.cfg.home / "models"):
+        item = {k: x.get(k) for k in keys}
+        label = x.get("ollama") or x.get("name")
+        if label in bench_map:
+            item["bench"] = bench_map[label]
+        models.append(item)
     h.send_json({
         "available": libraries_available(),
         "install_hint": INSTALL_HINT,
         "examples": len(training_examples(app.store)),
         "study": len(app.store.study_rows()),
-        "models": [{k: x.get(k) for k in keys} for x in read_models(app.cfg.home / "models")],
+        "role_counts": app.store.study_counts_by_role(),
+        "preferences": len(app.store.preference_rows()) + len(app.store.interaction_preferences()),
+        "weak_roles": weak_roles(app),
+        "presets": MODEL_PRESETS,
+        "profiles": OWN_PROFILES,
+        "recommended_base": recommended_base(),
+        "models": models,
         "job": h.api.work.snapshot(),
     })
+
+
+def _train_cfg_from_body(data: dict, *, default_auto: bool = False) -> TrainConfig:
+    profile = str(data.get("profile") or "").strip() or None
+    kw: dict = {}
+    if data.get("base") or data.get("preset") or (default_auto and not profile):
+        kw["base"] = resolve_base(data.get("base") or data.get("preset") or "auto")
+    for k, fn in (("epochs", int), ("batch_tokens", int), ("grad_accum", int), ("rank", int)):
+        if data.get(k) is not None:
+            kw[k] = fn(data[k])
+    for k in ("lr", "kl_beta", "neftune_alpha", "pref_beta", "loraplus_ratio"):
+        if data.get(k) is not None:
+            kw[k] = float(data[k])
+    if data.get("offload_optimizer") is not None:
+        kw["offload_optimizer"] = bool(data["offload_optimizer"])
+    if data.get("can_manage") is not None:
+        kw["can_manage"] = bool(data["can_manage"])
+    for k in ("from_adapter", "name", "quantize"):
+        if data.get(k):
+            kw[k] = str(data[k])
+    if data.get("roles"):
+        kw["roles"] = list(data["roles"])
+    if data.get("specialties"):
+        kw["specialties"] = list(data["specialties"])
+    try:
+        return config_for_profile(profile, **kw)
+    except TrainError as e:
+        raise HttpError(400, str(e)) from e
 
 
 @route("POST", r"/api/(study|train)")
@@ -700,11 +786,21 @@ def start_work(h: Handler, m, q):
         raise HttpError(409, "計測の実行中です。終わってから始めてください")
     if kind == "study":
         per_role = max(1, min(50, int(data.get("per_role", 15))))
-        work = lambda progress: run_study(app, per_role=per_role, on_progress=progress)  # noqa: E731
+        roles = [data["role"]] if data.get("role") else (weak_roles(app)[:4] if data.get("focus_weak") else None)
+        synthetic = max(0, min(200, int(data.get("synthetic", 0))))
+        wiki = max(0, min(120, int(data.get("wiki", 0))))
+        work = lambda progress: run_study(  # noqa: E731
+            app, per_role=per_role, roles=roles, synthetic=synthetic, wiki=wiki,
+            verify_llm=bool(data.get("verify_llm")), contrastive=bool(data.get("contrastive")),
+            on_progress=progress,
+        )
     else:
+        cfg = _train_cfg_from_body(data)
+        run_code = bool(data.get("run_code", False))
+
         def work(progress):
-            meta = train(app, TrainConfig(), on_progress=progress)
-            done = finish_model(app, meta["name"], on_progress=progress)
+            meta = train(app, cfg, on_progress=progress)
+            done = finish_model(app, meta["name"], run_code=run_code, quantize=cfg.quantize, on_progress=progress)
             base = done["base_report"]
             return {**meta, "model": done["model"], "export_error": done["export_error"],
                     "bench_correct": done["report"].correct, "bench_n": done["report"].n,
@@ -712,6 +808,50 @@ def start_work(h: Handler, m, q):
     if not api.work.start(kind, work):
         raise HttpError(409, "自習または学習がすでに実行中です")
     h.send_json({"ok": True})
+
+
+@route("POST", r"/api/study/review")
+def start_study_review(h: Handler, m, q):
+    api = h.api
+    if api.bench.snapshot()["running"]:
+        raise HttpError(409, "計測の実行中です。終わってから始めてください")
+    if not api.work.start("review", lambda progress: review_study(api.app, on_progress=progress)):
+        raise HttpError(409, "自習・学習・較正のどれかがすでに実行中です")
+    h.send_json({"ok": True})
+
+
+@route("POST", r"/api/evolve")
+def start_evolve(h: Handler, m, q):
+    api, data = h.api, h.body()
+    if api.bench.snapshot()["running"]:
+        raise HttpError(409, "計測の実行中です。終わってから始めてください")
+    cfg = _train_cfg_from_body(data, default_auto=True)
+    study_per_role = max(0, min(30, int(data.get("study_per_role", 8))))
+    synthetic = max(0, min(200, int(data.get("synthetic", 40))))
+    wiki = max(0, min(120, int(data.get("wiki", 24))))
+    run_code = bool(data.get("run_code", True))
+    work = lambda progress: evolve_own_ai(  # noqa: E731
+        api.app, config=cfg, study_per_role=study_per_role, synthetic=synthetic, wiki=wiki,
+        run_code=run_code, on_progress=progress,
+    )
+    if not api.work.start("evolve", work):
+        raise HttpError(409, "自習・学習・較正のどれかがすでに実行中です")
+    h.send_json({"ok": True})
+
+
+@route("POST", r"/api/own/delete", "local")
+def own_delete(h: Handler, m, q):
+    api, data = h.api, h.body()
+    if api.work.snapshot()["running"] or api.bench.snapshot()["running"]:
+        raise HttpError(409, "処理の実行中は削除できません")
+    name = str(data.get("name") or "").strip()
+    if not name:
+        raise HttpError(400, "削除するモデル名を指定してください")
+    try:
+        res = delete_own_model(api.app, name)
+    except (TrainError, ValueError) as e:
+        raise HttpError(404, str(e)) from e
+    h.send_json({"ok": True, **res})
 
 
 @route("GET", r"/api/bench")
@@ -724,7 +864,10 @@ def bench_start(h: Handler, m, q):
     data = h.body()
     if h.api.work.snapshot()["running"]:
         raise HttpError(409, "自習または学習の実行中です。終わってから始めてください")
-    if not h.api.bench.start(data.get("model") or None, bool(data.get("run_code")), bool(data.get("verify"))):
+    kind = "agent" if data.get("kind") == "agent" else "answers"
+    if kind == "agent" and h.remote:
+        raise PermissionError("エージェントの計測は、この PC の画面から始めてください(PC の上で実際にファイルを作ってコマンドを動かします)")
+    if not h.api.bench.start(data.get("model") or None, bool(data.get("run_code")), bool(data.get("verify")), kind):
         raise HttpError(409, "計測はすでに実行中です")
     h.send_json({"ok": True})
 
@@ -767,9 +910,20 @@ def conversation_update(h: Handler, m, q):
 
 @route("GET", r"/api/conversations/([A-Za-z0-9_-]+)/export")
 def conversation_export(h: Handler, m, q):
-    text = h.api.chats.export_markdown(m.group(1))
+    cid = m.group(1)
+    fmt = ((q.get("format") or ["md"])[0] or "md").lower()
+    text = h.api.chats.export_markdown(cid)
+    conv = h.api.chats.conversation(cid) or {}
+    name = office.file_name((conv.get("title") or "").strip() or "会話")
+    if fmt == "docx":
+        with tempfile.TemporaryDirectory() as tmp:
+            path = office.export_answer("docx", text, (conv.get("title") or "").strip() or "会話", Path(tmp) / "chat.docx")
+            data = path.read_bytes()
+        h.send_bytes(data, office.KINDS["docx"][0],
+                     headers={"Content-Disposition": f"attachment; filename*=UTF-8''{urllib.parse.quote(f'{name}.docx')}"})
+        return
     h.send_bytes(text.encode("utf-8"), "text/markdown; charset=utf-8",
-                 headers={"Content-Disposition": f"attachment; filename*=UTF-8''{urllib.parse.quote('会話.md')}"})
+                 headers={"Content-Disposition": f"attachment; filename*=UTF-8''{urllib.parse.quote(f'{name}.md')}"})
 
 
 @route("GET", r"/api/messages/([A-Za-z0-9_-]+)/export")
@@ -875,7 +1029,14 @@ def run_start(h: Handler, m, q):
                "use_cache": data.get("use_cache", True), "agent": bool(data.get("agent") or data.get("tools")),
                "swarm": {"on": True, "off": False}.get(data.get("swarm")), "folder": str(data.get("folder") or "")[:300] or None}
     if options["folder"]:
-        h.api.app.work_folder(options["folder"])  # 作業フォルダの外は選べない(始める前に確かめる)
+        try:
+            chosen = h.api.app.work_folder(options["folder"])  # 選べないフォルダは、始める前に断る
+        except ValueError:
+            if options["agent"]:
+                raise
+            chosen = options["folder"] = None  # 普通の会話は、選んだフォルダが無くなっていても続ける
+        if chosen is not None and options["agent"]:
+            h.api.app.remember_folder(chosen)
     context = data.get("context") or "auto"
     if history and not data.get("conversation_id"):  # 古い画面との互換: 会話の流れを直接受け取る
         context = "on"
@@ -1108,6 +1269,124 @@ def folders(h: Handler, m, q):
     h.send_json({"root": root.name, "folders": found})
 
 
+def _browse_roots(h: Handler) -> list[dict]:
+    """フォルダを選ぶときの近道: 作業フォルダ・最近のフォルダ・ホーム・デスクトップ・ドキュメント・ダウンロード・ドライブ。"""
+    app = h.api.app
+    home = Path.home()
+    picks: list[dict] = []
+
+    def add(label: str, path: Path | str | None, kind: str) -> None:
+        if not path:
+            return
+        path = Path(path)
+        if path.is_dir() and all(Path(x["path"]) != path for x in picks):
+            picks.append({"label": label, "path": str(path), "kind": kind})
+
+    add("作業フォルダ", app.workspace_root(), "workspace")
+    for folder in app.cfg.recent_folders[:6]:
+        add(Path(folder).name or folder, folder, "recent")
+    add("ホーム", home, "home")
+    for name, label in (("Desktop", "デスクトップ"), ("Documents", "ドキュメント"), ("Downloads", "ダウンロード"),
+                        ("OneDrive", "OneDrive"), ("Projects", "Projects")):
+        add(label, home / name, "place")
+    if os.name == "nt" and not h.remote:
+        import string
+        for letter in string.ascii_uppercase:
+            drive = Path(f"{letter}:\\")
+            if drive.exists():
+                add(f"{letter}: ドライブ", drive, "drive")
+    return picks
+
+
+def _browsable(h: Handler, path: Path) -> bool:
+    """スマホなど別の端末からは、ホームフォルダと作業フォルダの中だけを見せる(PC 全体のフォルダ構成は見せない)。"""
+    if not h.remote:
+        return True
+    roots = [Path.home().resolve()] + [r.resolve() for r in [h.api.app.workspace_root()] if r is not None]
+    return any(path == r or r in path.parents for r in roots)
+
+
+@route("GET", r"/api/browse")
+def browse(h: Handler, m, q):
+    """エージェントに作業させるフォルダを選ぶための一覧(フォルダだけ)。"""
+    app = h.api.app
+    raw = (q.get("path") or [""])[0].strip()
+    if not raw:
+        h.send_json({"path": "", "parent": None, "folders": [], "roots": _browse_roots(h), "mode": app.agent_mode()})
+        return
+    target = Path(os.path.expandvars(raw)).expanduser().resolve()
+    if not target.is_dir():
+        raise KeyError(f"フォルダが見つかりません: {raw}")
+    if not _browsable(h, target):
+        raise PermissionError("スマホからは、ホームフォルダと作業フォルダの中だけを選べます")
+    folders = []
+    try:
+        for p in sorted(target.iterdir(), key=lambda x: x.name.lower()):
+            try:
+                if p.is_dir() and not p.name.startswith(("$", ".")) and p.name not in ("System Volume Information", "__pycache__", "node_modules"):
+                    folders.append({"name": p.name, "path": str(p)})
+            except OSError:
+                continue
+            if len(folders) >= 400:
+                break
+    except OSError as e:
+        raise PermissionError(f"このフォルダは開けません: {e}") from e
+    parent = target.parent if target.parent != target else None
+    h.send_json({"path": str(target), "parent": str(parent) if parent and _browsable(h, parent) else None, "folders": folders,
+                 "roots": _browse_roots(h), "system": app.is_system_folder(target), "mode": app.agent_mode(),
+                 "usable": not app.is_system_folder(target) or app.agent_mode() == "full"})
+
+
+@route("POST", r"/api/browse/mkdir", "local")
+def browse_mkdir(h: Handler, m, q):
+    """フォルダを選ぶ画面から、新しいフォルダを作る(PC の画面からだけ)。"""
+    data = h.body()
+    parent = Path(str(data.get("path") or "")).expanduser().resolve()
+    name = str(data.get("name") or "").strip()
+    if not parent.is_dir():
+        raise KeyError("作る場所のフォルダが見つかりません")
+    if not name or any(c in name for c in '\\/:*?"<>|') or name in (".", ".."):
+        raise ValueError("フォルダの名前に使えない文字が含まれています")
+    target = parent / name
+    target.mkdir(exist_ok=True)
+    h.send_json({"path": str(target)})
+
+
+@route("GET", r"/api/vision/modes")
+def vision_modes(h: Handler, m, q):
+    h.send_json({"modes": [{"id": k, "label": v.label, "question": v.needs_question} for k, v in vision.MODES.items()],
+                 "available": h.api.app._vision_model() is not None})
+
+
+@route("POST", r"/api/vision")
+def vision_run(h: Handler, m, q):
+    """画像の認識(カメラ・写真・PC の画面)。スマホからも使える(PC の画面を見るのは、スマホからの操作が許可されているときだけ)。"""
+    data = h.body()
+    if data.get("source") == "screen":
+        _require_remote_control(h)
+        image = pc.capture(1280, "jpeg", 75)[0]
+    else:
+        image = vision.decode_image(str(data.get("image") or ""))
+    result = h.api.app.see(image, str(data.get("mode") or "describe"), str(data.get("question") or ""), str(data.get("lang") or "ja"))
+    if data.get("source") == "screen" and data.get("return_image"):
+        result["image"] = base64.b64encode(image).decode("ascii")
+    h.send_json(result)
+
+
+@route("GET", r"/api/processes")
+def processes_list(h: Handler, m, q):
+    """エージェントが起動して、動かし続けているプログラム(サーバーなど)。"""
+    h.send_json({"processes": toolbox.running_processes()})
+
+
+@route("POST", r"/api/processes/stop")
+def processes_stop(h: Handler, m, q):
+    name = str(h.body().get("name") or "")
+    if not toolbox.stop_named(name):
+        raise KeyError("そのプログラムは動いていません")
+    h.send_json({"ok": True})
+
+
 @route("GET", r"/api/files")
 def files_list(h: Handler, m, q):
     root, target, rel = _file_target(h, q)
@@ -1201,8 +1480,9 @@ def _flow_view(h: Handler, flow: dict) -> dict:
 def flows_list(h: Handler, m, q):
     cfg = h.api.app.cfg
     h.send_json({"flows": [_flow_view(h, f) for f in h.api.flows.list()], "steps": STEP_TYPES, "triggers": TRIGGER_TYPES,
-                 "ops": CONDITION_OPS, "can_edit": not h.remote,
-                 "allowed": {"net": cfg.tools_net, "files": bool(cfg.workspace), "write": bool(cfg.workspace) and cfg.tools_write,
+                 "ops": CONDITION_OPS, "templates": FLOW_TEMPLATES, "can_edit": not h.remote,
+                 "allowed": {"net": cfg.tools_net, "files": h.api.app.workspace_root() is not None,
+                             "write": h.api.app.workspace_root() is not None and cfg.tools_write,
                              "run": cfg.tools_run}})
 
 
@@ -1275,6 +1555,71 @@ route("POST", r"/api/hooks/([A-Za-z0-9_-]+)", "public")(_hook)
 route("GET", r"/api/hooks/([A-Za-z0-9_-]+)", "public")(_hook)
 
 
+# ---- 知識ベース (RAG) ----------------------------------------------------------
+
+@route("GET", r"/api/kb")
+def kb_list(h: Handler, m, q):
+    kb = h.api.app.kb
+    h.send_json({"stats": kb.stats(), "docs": kb.list_docs(), "embed_model": h.api.app.embedder.model})
+
+
+@route("POST", r"/api/kb/add", "local")
+def kb_add(h: Handler, m, q):
+    data = h.body()
+    kb = h.api.app.kb
+    kind = str(data.get("kind") or "note").strip().lower()
+    tags = str(data.get("tags") or "").strip()
+    if kind == "note":
+        title = str(data.get("title") or "").strip()
+        text = str(data.get("text") or "").strip()
+        if not title or not text:
+            raise ValueError("題名と本文を入力してください")
+        res = kb.add_note(title, text, tags=tags)
+    elif kind == "file":
+        path = str(data.get("path") or "").strip()
+        if not path:
+            raise ValueError("ファイルパスを指定してください")
+        res = kb.add_file(path, tags=tags)
+    elif kind == "folder":
+        path = str(data.get("path") or "").strip()
+        if not path:
+            raise ValueError("フォルダパスを指定してください")
+        limit = max(1, min(200, int(data.get("max_files", 80))))
+        res = kb.add_folder(path, limit=limit, tags=tags)
+    elif kind == "url":
+        url = str(data.get("url") or "").strip()
+        if not url:
+            raise ValueError("URL を指定してください")
+        res = kb.add_url(url, title=str(data.get("title") or ""), tags=tags)
+    else:
+        raise ValueError(f"未対応の種類です: {kind}")
+    h.send_json({"ok": True, "result": res, "stats": kb.stats()})
+
+
+@route("POST", r"/api/kb/search")
+def kb_search(h: Handler, m, q):
+    data = h.body()
+    query = str(data.get("query") or "").strip()
+    top_k = max(1, min(20, int(data.get("top_k", 5))))
+    hits = h.api.app.kb.search(query, top_k=top_k) if query else []
+    h.send_json({"hits": hits})
+
+
+@route("POST", r"/api/kb/delete", "local")
+def kb_delete(h: Handler, m, q):
+    data = h.body()
+    target = data.get("id")
+    if target is None or target == "":
+        raise ValueError("id を指定してください")
+    try:
+        doc_key: int | str = int(target)
+    except (TypeError, ValueError):
+        doc_key = str(target)
+    if not h.api.app.kb.remove(doc_key):
+        raise KeyError("資料が見つかりません")
+    h.send_json({"ok": True, "stats": h.api.app.kb.stats()})
+
+
 # ---- スマホ用のモデルとアプリ ---------------------------------------------------
 
 @route("GET", r"/api/phone/models")
@@ -1297,6 +1642,11 @@ def apk(h: Handler, m, q):
     if path is None:
         raise KeyError("アプリがまだ作られていません")
     h.send_file(path, "application/vnd.android.package-archive", "celestial.apk")
+
+
+@route("GET", r"/api/app", "public")
+def app_version(h: Handler, m, q):
+    h.send_json(h.api.apk_info())
 
 
 @route("GET", r"/pair", "public")

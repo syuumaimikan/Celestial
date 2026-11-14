@@ -15,15 +15,84 @@ from pathlib import Path
 
 from .backends.native import META_FILE, read_models
 
-# ChatML 形式のテンプレート(Qwen 系)
-_CHATML = '''TEMPLATE """{{- range .Messages }}<|im_start|>{{ .Role }}
+# ChatML 形式のテンプレート(Qwen 系)。改行は必ず LF にする(Windows の CRLF だと <|im_start|>assistant の後ろが別トークンになる)
+_CHATML = '''TEMPLATE """{{- if .Messages }}
+{{- if .System }}<|im_start|>system
+{{ .System }}<|im_end|>
+{{ end }}
+{{- range $i, $_ := .Messages }}
+{{- $last := eq (len (slice $.Messages $i)) 1 -}}
+{{- if eq .Role "user" }}<|im_start|>user
 {{ .Content }}<|im_end|>
-{{ end }}<|im_start|>assistant
-"""
+{{ else if eq .Role "assistant" }}<|im_start|>assistant
+{{ .Content }}{{ if not $last }}<|im_end|>
+{{ end }}
+{{- else if eq .Role "system" }}<|im_start|>system
+{{ .Content }}<|im_end|>
+{{ end }}
+{{- if and (ne .Role "assistant") $last }}<|im_start|>assistant
+{{ end }}
+{{- end }}
+{{- else }}
+{{- if .System }}<|im_start|>system
+{{ .System }}<|im_end|>
+{{ end }}<|im_start|>user
+{{ .Prompt }}<|im_end|>
+<|im_start|>assistant
+{{ end }}"""
 PARAMETER stop <|im_start|>
 PARAMETER stop <|im_end|>
 PARAMETER stop <|endoftext|>
 '''
+
+# Qwen3 非思考モード (/no_think) テンプレート: <think>\n\n</think>\n\n を先頭に差し込み不要な思考出力を抑える
+_QWEN3_NOTHINK_CHATML = '''TEMPLATE """{{- if .Messages }}
+{{- if .System }}<|im_start|>system
+{{ .System }}<|im_end|>
+{{ end }}
+{{- range $i, $_ := .Messages }}
+{{- $last := eq (len (slice $.Messages $i)) 1 -}}
+{{- if eq .Role "user" }}<|im_start|>user
+{{ .Content }}<|im_end|>
+{{ else if eq .Role "assistant" }}<|im_start|>assistant
+{{ if $last }}<think>
+
+</think>
+
+{{ end }}{{ .Content }}{{ if not $last }}<|im_end|>
+{{ end }}
+{{- else if eq .Role "system" }}<|im_start|>system
+{{ .Content }}<|im_end|>
+{{ end }}
+{{- if and (ne .Role "assistant") $last }}<|im_start|>assistant
+<think>
+
+</think>
+
+{{ end }}
+{{- end }}
+{{- else }}
+{{- if .System }}<|im_start|>system
+{{ .System }}<|im_end|>
+{{ end }}<|im_start|>user
+{{ .Prompt }}<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+{{ end }}"""
+PARAMETER stop <|im_start|>
+PARAMETER stop <|im_end|>
+PARAMETER stop <|endoftext|>
+'''
+
+
+def chat_template_for(model_type: str, *, thinking: bool = False) -> str:
+    """基礎モデル種別に応じた Ollama Modelfile テンプレートを返す。"""
+    if model_type == "qwen3" and not thinking:
+        return _QWEN3_NOTHINK_CHATML
+    return _CHATML
 
 
 class ExportError(RuntimeError):
@@ -34,16 +103,33 @@ def ollama_available() -> bool:
     return shutil.which("ollama") is not None
 
 
+def remove_from_ollama(ollama_name: str) -> None:
+    """Ollama に登録済みの自作モデルを削除する(存在しなくても例外は出さない)。"""
+    exe = shutil.which("ollama")
+    if exe is None or not ollama_name:
+        return
+    try:
+        subprocess.run([exe, "rm", ollama_name], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
 def write_gguf(model, tokenizer, tokenizer_dir: Path, out_path: Path, name: str) -> None:
-    """Qwen2 系の transformers モデルを F16 の GGUF として書き出す。"""
+    """Qwen2 / Qwen3 系の transformers モデルを F16 の GGUF として書き出す。"""
     import gguf
     import numpy as np
 
     config = model.config
-    if getattr(config, "model_type", "") != "qwen2":
-        raise ExportError(f"基礎モデルの形式 {getattr(config, 'model_type', '?')} は Ollama への書き出しに未対応です(対応: Qwen2 / Qwen2.5 系)")
+    model_type = getattr(config, "model_type", "")
+    arch_map = {
+        "qwen2": ("qwen2", gguf.MODEL_ARCH.QWEN2),
+        "qwen3": ("qwen3", gguf.MODEL_ARCH.QWEN3),
+    }
+    if model_type not in arch_map:
+        raise ExportError(f"基礎モデルの形式 {model_type or '?'} は Ollama への書き出しに未対応です(対応: Qwen2 / Qwen2.5 / Qwen3 系)")
+    arch_name, gguf_arch = arch_map[model_type]
 
-    writer = gguf.GGUFWriter(str(out_path), "qwen2")
+    writer = gguf.GGUFWriter(str(out_path), arch_name)
     writer.add_name(name)
     writer.add_context_length(config.max_position_embeddings)
     writer.add_embedding_length(config.hidden_size)
@@ -51,6 +137,10 @@ def write_gguf(model, tokenizer, tokenizer_dir: Path, out_path: Path, name: str)
     writer.add_feed_forward_length(config.intermediate_size)
     writer.add_head_count(config.num_attention_heads)
     writer.add_head_count_kv(config.num_key_value_heads)
+    head_dim = getattr(config, "head_dim", None)
+    if head_dim:
+        writer.add_key_length(int(head_dim))
+        writer.add_value_length(int(head_dim))
     writer.add_layer_norm_rms_eps(config.rms_norm_eps)
     writer.add_rope_freq_base(float(getattr(config, "rope_theta", None) or (getattr(config, "rope_parameters", None) or {}).get("rope_theta", 1000000.0)))
     writer.add_file_type(gguf.LlamaFileType.MOSTLY_F16)
@@ -79,7 +169,7 @@ def write_gguf(model, tokenizer, tokenizer_dir: Path, out_path: Path, name: str)
     writer.add_token_types(types)
     gguf.SpecialVocab(str(tokenizer_dir), load_merges=True, n_vocab=len(tokens)).add_to_gguf(writer)
 
-    names = gguf.get_tensor_name_map(gguf.MODEL_ARCH.QWEN2, config.num_hidden_layers)
+    names = gguf.get_tensor_name_map(gguf_arch, config.num_hidden_layers)
     tied = bool(getattr(config, "tie_word_embeddings", False))
     for key, tensor in model.state_dict().items():
         if key == "lm_head.weight" and tied:
@@ -116,14 +206,18 @@ def export_to_ollama(models_dir: Path, name: str, *, quantize: str = "q8_0", tim
     with tempfile.TemporaryDirectory(prefix="celestial-export-") as tmp:
         work = Path(tmp)
         tokenizer = AutoTokenizer.from_pretrained(meta["base"])
-        model = AutoModelForCausalLM.from_pretrained(meta["base"], dtype=torch.float32)
+        load_dtype = torch.float16 if int(meta.get("size_bytes", 0)) > 4_000_000_000 else torch.float32
+        model = AutoModelForCausalLM.from_pretrained(meta["base"], dtype=load_dtype)
         if meta.get("adapter", True):
             model = PeftModel.from_pretrained(model, meta["path"]).merge_and_unload()
         tokenizer.save_pretrained(str(work))
+        model_type = getattr(model.config, "model_type", "")
         write_gguf(model, tokenizer, work, work / "model.gguf", name)
         del model
 
-        (work / "Modelfile").write_text(f"FROM {(work / 'model.gguf').as_posix()}\n" + _CHATML, encoding="utf-8")
+        # 改行は必ず LF にする(Windows でもトークン列が学習時と一致するように)
+        tmpl = chat_template_for(model_type, thinking=bool(meta.get("thinking", False)))
+        (work / "Modelfile").write_text(f"FROM {(work / 'model.gguf').as_posix()}\n" + tmpl, encoding="utf-8", newline="\n")
         command = [exe, "create", name, "-f", str(work / "Modelfile")]
         if quantize:
             command += ["-q", quantize]
@@ -139,5 +233,7 @@ def export_to_ollama(models_dir: Path, name: str, *, quantize: str = "q8_0", tim
     meta_path = Path(meta["path"]) / META_FILE
     saved = json.loads(meta_path.read_text(encoding="utf-8"))
     saved["ollama"] = ollama_name  # 以後は Ollama 側のモデルとして扱い、native の一覧からは外す
+    if quantize:
+        saved["quantize"] = quantize
     meta_path.write_text(json.dumps(saved, ensure_ascii=False, indent=2), encoding="utf-8")
     return ollama_name

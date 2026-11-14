@@ -527,6 +527,8 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
       'route' => '${role(e['role'])}の担当へ',
       'worker' => e['agent'] == true ? '${e['model']} がエージェントとして作業中' : '${e['model']} が回答中',
       'agent_step' => '[${e['n']}手目] ${e['label']} ${e['detail'] ?? ''}',
+      'agent_review' => (e['about'] == 'server' ? '起動したサーバーのページがエラーでした。直してから報告します: ' : 'やり残しを見つけたので続けます: ') +
+          ((e['missing'] as List?) ?? const []).join('、'),
       'verify' => '管理AIが回答を検証中…',
       'retry' => e['issue'] != null ? '${e['model']} が${e['issue']}中' : '検証で問題が見つかったため再回答中',
       'escalate' => e['reason'] == 'lang' ? '言語を取り違えたため ${e['model']} が答え直し中' : '確からしさが低いため ${e['model']} が答え直し中',
@@ -565,7 +567,7 @@ class AppState extends ChangeNotifier with WidgetsBindingObserver {
         return;
       }
       final name = settings.localModel;
-      if (name.isEmpty || ai.find(name) == null) throw LlmException('端末内のAIがまだありません。「AIモデル」で PC から受け取ってください');
+      if (name.isEmpty || ai.find(name) == null) throw LlmException('端末内のAIがまだありません。設定の「AIモデル」で PC から受け取ってください');
       // 会話の流れは、新しいものから文字数の予算に収まる分だけ渡す
       final budget = (settings.contextSize * 1.2).round();
       final picked = <LlmMessage>[];

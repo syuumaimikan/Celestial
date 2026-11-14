@@ -373,6 +373,21 @@ class ChatStoreTest(unittest.TestCase):
         self.assertTrue(needs_context("もっと短く", has_history=True))
         self.assertFalse(needs_context("次の文章を要約して:\n" + "長い本文。" * 30, has_history=True))
         self.assertFalse(needs_context("東京から大阪までの新幹線の所要時間と、移動の選択肢を比べて詳しく教えてください", has_history=True))
+        # 作業が途中で止まった直後の短い発言は、その作業への指示(「openmeteo を使って」)
+        hint = "openmeteoを使用して天気などを取得する"
+        self.assertFalse(needs_context(hint, True, "サイネージを作りました。"))
+        self.assertTrue(needs_context(hint, True, "【注意】うまく進まない状態が続いたため、途中で打ち切りました。"))
+        self.assertTrue(needs_context("openmeteoの使い方を調べて、それを参考に続きから作成して", True))
+
+    def test_continuation_keeps_the_first_request(self):
+        chats = ChatStore(Store())
+        conv = chats.create_conversation("t")
+        for i in range(5):
+            chats.add_message(conv["id"], "user", f"依頼{i}")
+            chats.add_message(conv["id"], "assistant", f"回答{i}")
+        self.assertEqual([u for u, _ in chats.history_pairs(conv["id"], turns=3)], ["依頼2", "依頼3", "依頼4"])
+        # 「続きから作成して」では、会話の最初の依頼(元の目的)も渡す
+        self.assertEqual([u for u, _ in chats.history_pairs(conv["id"], turns=3, keep_first=True)], ["依頼0", "依頼2", "依頼3", "依頼4"])
 
 
 class TitleTest(unittest.TestCase):
@@ -469,6 +484,144 @@ class QrTest(unittest.TestCase):
                     if q.modules[y][x]:
                         img.paste(0, ((x + border) * scale, (y + border) * scale, (x + border + 1) * scale, (y + border + 1) * scale))
             self.assertEqual(zxingcpp.read_barcodes(img)[0].text, text)
+
+
+class OwnApiTest(unittest.TestCase):
+    def test_own_info_review_and_delete(self):
+        import json
+        import tempfile
+        import threading
+        import time
+        import urllib.request
+        from pathlib import Path
+        from celestial.backends.mock import MockBackend
+        from celestial.backends.base import ModelInfo
+        from celestial.backends.native import META_FILE, NativeBackend
+        from celestial.config import Config
+        from celestial.evolve.store import Store
+        from celestial.manager import Celestial
+        from celestial.server import make_server
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            home = Path(tmp)
+            mdir = home / "models" / "celestial-v1"
+            mdir.mkdir(parents=True)
+            (mdir / META_FILE).write_text(json.dumps({"name": "celestial-v1", "base": "Qwen/Qwen2.5-0.5B-Instruct"}), encoding="utf-8")
+            mock = MockBackend("mock", lambda _m, _msgs, _s=None: '{"ok": true}', [ModelInfo("small", "mock", 1_000_000_000)])
+            app = Celestial(Config(home=home), backends={"mock": mock, "native": NativeBackend("native", models_dir=str(home / "models"))}, store=Store())
+            app.store.add_study(task="光合成を教えて", role="general", model="small",
+                                answer="はい、承知いたしました。\n\n植物の反応です。")
+            srv = make_server(app, 0)
+            t = threading.Thread(target=srv.serve_forever, daemon=True)
+            t.start()
+            base = f"http://127.0.0.1:{srv.server_address[1]}"
+            try:
+                with urllib.request.urlopen(f"{base}/api/own") as r:
+                    info = json.loads(r.read())
+                self.assertIn("presets", info)
+                self.assertIn("profiles", info)
+                self.assertIn("coder", info["profiles"])
+                self.assertIn("recommended_base", info)
+                self.assertEqual(info["role_counts"].get("general"), 1)
+                self.assertEqual(len(info["models"]), 1)
+
+                req = urllib.request.Request(f"{base}/api/study/review", data=b"{}", headers={"Content-Type": "application/json"}, method="POST")
+                with urllib.request.urlopen(req) as r:
+                    self.assertTrue(json.loads(r.read())["ok"])
+                for _ in range(40):
+                    with urllib.request.urlopen(f"{base}/api/own") as r:
+                        snap = json.loads(r.read())["job"]
+                    if not snap["running"]:
+                        break
+                    time.sleep(0.05)
+                self.assertFalse(snap["running"])
+                self.assertEqual(app.store.study_rows()[0]["answer"], "植物の反応です。")
+
+                del_req = urllib.request.Request(
+                    f"{base}/api/own/delete",
+                    data=json.dumps({"name": "celestial-v1"}).encode(),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(del_req) as r:
+                    self.assertEqual(json.loads(r.read())["deleted"], "celestial-v1")
+                self.assertFalse(mdir.exists())
+            finally:
+                srv.api.flows.stop()
+                srv.shutdown()
+                srv.server_close()
+
+    def test_kb_routes_cli_and_chat_docx_export(self):
+        import json
+        import tempfile
+        import threading
+        import urllib.request
+        from pathlib import Path
+        from celestial.backends.base import ModelInfo
+        from celestial.backends.mock import MockBackend
+        from celestial.cli import main as cli_main
+        from celestial.config import Config
+        from celestial.evolve.store import Store
+        from celestial.manager import Celestial
+        from celestial.server import make_server
+
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            home = Path(tmp)
+            mock = MockBackend("mock", lambda _m, _msgs, _s=None: '{"role": "general"}', [ModelInfo("small", "mock", 1_000_000_000)])
+            app = Celestial(Config(home=home), backends={"mock": mock}, store=Store())
+            srv = make_server(app, 0)
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+            base = f"http://127.0.0.1:{srv.server_address[1]}"
+            try:
+                req = urllib.request.Request(
+                    f"{base}/api/kb/add",
+                    data=json.dumps({"kind": "note", "title": "API規則", "text": "レスポンスはJSON形式で返します。"}).encode(),
+                    headers={"Content-Type": "application/json"}, method="POST",
+                )
+                with urllib.request.urlopen(req) as r:
+                    self.assertTrue(json.loads(r.read())["ok"])
+
+                req_s = urllib.request.Request(
+                    f"{base}/api/kb/search",
+                    data=json.dumps({"query": "JSON形式"}).encode(),
+                    headers={"Content-Type": "application/json"}, method="POST",
+                )
+                with urllib.request.urlopen(req_s) as r:
+                    hits = json.loads(r.read())["hits"]
+                self.assertEqual(len(hits), 1)
+                doc_id = hits[0]["doc_id"]
+
+                with urllib.request.urlopen(f"{base}/api/kb") as r:
+                    listing = json.loads(r.read())
+                self.assertEqual(listing["stats"]["docs"], 1)
+
+                # 会話の .docx エクスポート
+                conv = srv.api.chats.create_conversation("テスト議事録")
+                srv.api.chats.add_message(conv["id"], "user", "要点は?")
+                srv.api.chats.add_message(conv["id"], "assistant", "3つの改善点をまとめました。")
+                with urllib.request.urlopen(f"{base}/api/conversations/{conv['id']}/export?format=docx") as r:
+                    raw = r.read()
+                self.assertTrue(raw.startswith(b"PK"))
+
+                req_d = urllib.request.Request(
+                    f"{base}/api/kb/delete",
+                    data=json.dumps({"id": doc_id}).encode(),
+                    headers={"Content-Type": "application/json"}, method="POST",
+                )
+                with urllib.request.urlopen(req_d) as r:
+                    self.assertTrue(json.loads(r.read())["ok"])
+            finally:
+                srv.api.flows.stop()
+                srv.shutdown()
+                srv.server_close()
+
+            # CLI kb add / list / search / rm (分離された home で確認)
+            cfg_path = home / "config.toml"
+            cfg_path.write_text(f"home = {json.dumps(str(home))}\n", encoding="utf-8")
+            self.assertEqual(cli_main(["--config", str(cfg_path), "kb", "add", "--note", "--title", "CLI資料", "ポートは9999"]), 0)
+            self.assertEqual(cli_main(["--config", str(cfg_path), "kb", "list"]), 0)
+            self.assertEqual(cli_main(["--config", str(cfg_path), "kb", "search", "ポート"]), 0)
+            self.assertEqual(cli_main(["--config", str(cfg_path), "kb", "rm", "note:CLI資料"]), 0)
 
 
 if __name__ == "__main__":

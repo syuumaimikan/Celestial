@@ -21,6 +21,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Callable
 
+from .codecheck import python_problem
 from .tools import ToolContext, ToolError, execute
 
 _PROJECT_REQUEST = re.compile(
@@ -55,12 +56,24 @@ PLAN_SYSTEM = """You plan a small software project for a local AI to write file 
 FILE_SYSTEM = ("You write exactly one file of a software project. Output only the complete content of that file: "
                 "no explanations, no Markdown code fences. Make it consistent with the plan and with the files already written "
                 "(use the same function and class names). Write comments, messages shown to the user, and README text "
-                "in the language of the request.")
+                "in the language of the request. Use the exact values the request gives (port numbers, file names, texts), "
+                "even if the instructions differ. A web server must answer HTTP requests and keep running until it is stopped "
+                "(in Python: http.server with BaseHTTPRequestHandler and serve_forever), not a raw socket that answers once. "
+                "Write the file in the language of its file type only: a .py file contains only Python code (the HTML "
+                "page of a Flask app is a separate file, templates/index.html, returned with render_template), and an "
+                ".html file contains the page.")
+
+
+_NOT_NEW = re.compile(r"続き|続けて|再開|調べて|検索して|参考に|\b(continue|resume|research|look up|search)\b", re.I)
 
 
 def looks_like_project_request(task: str) -> bool:
-    """「〜アプリを作って」のような、新しいプロジェクトを作る依頼か(既存のファイルを直す依頼は除く)。"""
-    return bool(_PROJECT_REQUEST.search(task)) and not _EDIT_REQUEST.search(task)
+    """「〜アプリを作って」のような、新しいプロジェクトを作る依頼か。
+
+    既存のファイルを直す依頼・前の作業の続き・調べものが要る依頼(「サイトで調べて、参考に作成して」)は除く。
+    これらは、ファイルを読んだりネットを調べたりできるエージェントに任せる。
+    """
+    return bool(_PROJECT_REQUEST.search(task)) and not _EDIT_REQUEST.search(task) and not _NOT_NEW.search(task)
 
 
 def _clean_path(path: str) -> str | None:
@@ -94,22 +107,47 @@ def clean_plan(data: dict) -> dict:
             "files": files, "run": str(data.get("run") or "").strip()[:200], "test": str(data.get("test") or "").strip()[:200]}
 
 
-def strip_fences(text: str) -> str:
-    """AIがコードを ``` で囲んでしまったときは、中身だけを取り出す。"""
+_FENCE_BLOCK = re.compile(r"^[ \t]*```[^\n]*\n([\s\S]*?)^[ \t]*```[ \t]*$", re.M)
+_DOCS = (".md", ".markdown", ".txt", ".rst")
+
+
+def strip_fences(text: str, path: str | None = None) -> str:
+    """AIがコードを ``` で囲んだり、前後に説明やファイル名を書いてしまったときは、ファイルの中身だけを取り出す。
+
+    Markdown などの文書は、中に ``` のコード例を含むことがあるので、全体を囲んだ場合だけ外す。
+    """
     text = text.strip("\n")
-    fenced = re.match(r"^\s*```[^\n]*\n([\s\S]*?)\n?```\s*$", text)
-    return (fenced.group(1) if fenced else text) + "\n"
+    whole = re.match(r"^\s*```[^\n]*\n([\s\S]*?)\n?```\s*$", text)
+    doc = path is not None and Path(path).suffix.lower() in _DOCS
+    if whole and (doc or not re.search(r"^[ \t]*```", whole.group(1), re.M)):
+        return whole.group(1).strip("\n") + "\n"
+    if not doc:
+        blocks = [m.group(1) for m in _FENCE_BLOCK.finditer(text)]
+        if blocks:  # 説明やファイル名の行に挟まれたコード: いちばん長い囲みが中身
+            return max(blocks, key=len).strip("\n") + "\n"
+        if text.lstrip().startswith("```"):  # 閉じていない囲み
+            text = text.lstrip().partition("\n")[2]
+    if path:  # 先頭の、ファイル名だけの行(「primes/primes.py」「# File: app.js」など)
+        first, _, rest = text.partition("\n")
+        name = re.sub(r"^(file(name)?|path|ファイル(名)?)\s*[:：]\s*", "", first.strip().strip("#*`/ :"), flags=re.I).strip("`* ")
+        norm = path.replace("\\", "/").lower()
+        if rest.strip() and name and name.replace("\\", "/").lower() in {norm, norm.rsplit("/", 1)[-1]}:
+            text = rest
+    return text.strip("\n") + "\n"
 
 
 def syntax_error(path: str, content: str) -> str | None:
-    """構文の誤り(なければ None)。Python・JSON・JavaScript(node があれば)を確かめる。"""
+    """構文の誤りなど、動かす前に分かる誤り(なければ None)。Python・JSON・JavaScript(node があれば)を確かめる。
+
+    Python は、定義も import もしていない名前(app = Flask(__name__) の書き忘れなど)も見る。
+    """
     suffix = Path(path).suffix.lower()
     if suffix == ".py":
         try:
             compile(content, path, "exec")
         except SyntaxError as e:
             return f"{path}:{e.lineno}: SyntaxError: {e.msg}"
-        return None
+        return python_problem(path, content)
     if suffix == ".json":
         try:
             json.loads(content)
@@ -222,7 +260,7 @@ def create_project(*, request: str, ctx: ToolContext, plan_fn: Callable[[str], d
     total = len(plan["files"])
     for number, item in enumerate(plan["files"], 1):
         emit("file", path=item["path"], n=number, total=total)
-        content = strip_fences(write_fn(_file_prompt(plan, request, item["path"], written)))
+        content = strip_fences(write_fn(_file_prompt(plan, request, item["path"], written)), item["path"])
         written[item["path"]] = content
         execute(quiet, "write_file", {"path": f"{folder}/{item['path']}", "content": content})
 
@@ -255,7 +293,7 @@ def create_project(*, request: str, ctx: ToolContext, plan_fn: Callable[[str], d
             break
         for path, problem in problems.items():
             emit("fix", path=path, attempt=attempt + 1)
-            content = strip_fences(write_fn(_file_prompt(plan, request, path, written, problem, tests_wrong)))
+            content = strip_fences(write_fn(_file_prompt(plan, request, path, written, problem, tests_wrong)), path)
             written[path] = content
             execute(quiet, "write_file", {"path": f"{folder}/{path}", "content": content})
     return {"folder": folder, "title": plan["title"], "files": plan["files"], "checks": checks, "test": test, "run": plan["run"]}

@@ -164,10 +164,19 @@ async function copy(text, button) {
   catch { toast("コピーできませんでした"); }
 }
 
+// 使った道具の流れ(長いときは、最初の3つと最後だけ。全部は指を置くと出る)
+function toolChain(tools) {
+  const names = tools.map((c) => c.label + (c.ok ? "" : "(失敗)"));
+  return (names.length > 5 ? [...names.slice(0, 3), "…", names[names.length - 1]] : names).join(" → ");
+}
+
 // ---- 表示の切り替え ----
-const loaders = { learn: () => loadLearn(), bench: () => loadBench(), settings: () => loadSettings(), phone: () => loadPhone() };
+const narrowScreen = matchMedia("(max-width: 760px)");  // スマホくらいの幅(会話の一覧を重ねて出す)
+const loaders = { learn: () => loadLearn(), bench: () => loadBench(), settings: () => loadSettings(), phone: () => loadPhone(),
+  vision: () => loadVision(), kb: () => loadKb() };
 let currentView = "chat";
 function show(view) {
+  if (currentView === "vision" && view !== "vision") visionLeave();
   currentView = view;
   for (const b of $("nav").children) b.classList.toggle("on", b.dataset.view === view);
   for (const s of document.querySelectorAll(".view")) s.hidden = s.id !== "view-" + view;
@@ -179,7 +188,9 @@ $("nav").addEventListener("click", (e) => { const b = e.target.closest("button")
 const THEMES = [["", "自動"], ["light", "ライト"], ["dark", "ダーク"]];
 function applyTheme(value) {
   if (value) document.documentElement.dataset.theme = value; else delete document.documentElement.dataset.theme;
-  $("theme").textContent = "表示: " + (THEMES.find((t) => t[0] === value) || THEMES[0])[1];
+  const label = (THEMES.find((t) => t[0] === value) || THEMES[0])[1];
+  $("theme").lastElementChild.textContent = label;
+  $("theme").title = `表示: ${label}(押すと切り替え)`;
 }
 let theme = "";
 try { theme = localStorage.getItem("celestial-theme") || ""; } catch {}
@@ -195,13 +206,14 @@ async function loadState() {
   const status = $("status");
   status.className = "status " + (STATE.error ? "ng" : "ok");
   status.lastElementChild.textContent = STATE.error ? "AIに接続できません" : `${STATE.models.length}個のAIが利用可能`;
-  status.title = STATE.error || "";
+  status.title = status.lastElementChild.textContent + (STATE.error ? "\n" + STATE.error : "");  // 狭い画面では点だけになるので、言葉は指を置くと出す
   const role = $("opt-role");
   if (role.options.length === 1) for (const r of STATE.roles) role.append(h("option", { value: r.name }, r.label));
   const bench = $("bench-model"), keep = bench.value;
   bench.length = 1;
   for (const m of STATE.models) bench.append(h("option", { value: m.name }, m.name + " に固定"));
   bench.value = keep;
+  renderAgentBar();
   return STATE;
 }
 
@@ -212,7 +224,7 @@ async function refreshLinkStatus() {
     const on = d.remote.listening.length > 0;
     el.className = "status " + (on ? "ok" : "ng");
     el.lastElementChild.textContent = on ? `スマホ連携: 待受中(端末 ${d.devices.length})` : ts.state === "missing" ? "スマホ連携: Tailscale なし" : "スマホ連携: 未接続";
-    el.title = on ? d.remote.urls.join("\n") : (d.remote.error || `Tailscale の状態: ${ts.state}`);
+    el.title = el.lastElementChild.textContent + "\n" + (on ? d.remote.urls.join("\n") : (d.remote.error || `Tailscale の状態: ${ts.state}`));
   } catch { /* 起動直後などは無視 */ }
 }
 
@@ -245,21 +257,146 @@ function scrollDown(force) {
 function grow() { const t = $("task"); t.style.height = "auto"; t.style.height = Math.min(t.scrollHeight, 220) + "px"; }
 const pressed = (id) => $(id).getAttribute("aria-pressed") === "true";
 for (const id of ["opt-verify", "opt-swarm", "opt-agent"]) {
-  $(id).addEventListener("click", () => { $(id).setAttribute("aria-pressed", String(!pressed(id))); if (id === "opt-agent") showFolderPick(); });
+  $(id).addEventListener("click", () => $(id).setAttribute("aria-pressed", String(!pressed(id))));
 }
 
-// エージェントが作業するフォルダ(作業フォルダの中から選ぶ。Codex や Claude Code のように、そのフォルダの中で編集する)
-async function showFolderPick() {
-  const pick = $("opt-folder-pick");
-  pick.hidden = !pressed("opt-agent");
-  if (pick.hidden) return;
+// ---- エージェントの作業フォルダと権限(Codex や Claude Code のように、選んだフォルダの中で作業する) ----
+let selectedFolder = "";
+try { selectedFolder = localStorage.getItem("celestial-folder") || ""; } catch {}
+const MODE_WARN = "権限を「すべて許可」にすると、すべてのコマンド・ファイルの編集・PC の操作・ネットの利用を、確認なしで行います。" +
+  "作業フォルダの外も含め、PC のどこでも変更できます。よろしいですか?";
+const baseName = (path) => { const parts = String(path).replace(/[\\/]+$/, "").split(/[\\/]/); return parts[parts.length - 1] || String(path); };
+
+function renderAgentBar() {
+  const root = STATE.workspace_root || "";
+  $("opt-folder-name").textContent = selectedFolder ? baseName(selectedFolder) : `作業フォルダ${root ? "(" + baseName(root) + ")" : ""}`;
+  $("opt-folder").title = `エージェントが作業するフォルダ: ${selectedFolder || root || "(未設定)"}\nクリックして、PC の好きなフォルダを選べます`;
+  const select = $("opt-mode"), modes = STATE.agent_modes || [];
+  if (select.options.length !== modes.length) {
+    select.replaceChildren(...modes.map((m) => h("option", { value: m.id, title: m.description }, m.label)));
+  }
+  select.value = (STATE.settings && STATE.settings.agent_mode) || "auto";
+  $("opt-mode-pick").classList.toggle("danger", select.value === "full");
+  const mode = modes.find((m) => m.id === select.value);
+  $("opt-mode-pick").title = mode ? `権限: ${mode.label} — ${mode.description}` : "";
+}
+
+function setFolder(path) {
+  selectedFolder = path && path !== STATE.workspace_root ? path : "";
+  try { localStorage.setItem("celestial-folder", selectedFolder); } catch {}
+  renderAgentBar();
+}
+
+$("opt-folder").addEventListener("click", () => openFolderPicker({ current: selectedFolder || STATE.workspace_root, onPick: setFolder }));
+$("opt-mode").addEventListener("change", (e) => setMode(e.target.value));
+
+async function setMode(value) {
+  if (value === "full" && !confirm(MODE_WARN)) { renderAgentBar(); return false; }
   try {
-    const data = await api("/api/folders");
-    const select = $("opt-folder"), keep = select.value;
-    if (!data.root) { pick.hidden = true; return; }
-    select.replaceChildren(h("option", { value: "" }, `${data.root}(作業フォルダ全体)`), ...data.folders.map((f) => h("option", { value: f }, f)));
-    select.value = data.folders.includes(keep) ? keep : "";
-  } catch { pick.hidden = true; }
+    await api("/api/settings", { agent_mode: value });
+    await loadState();
+    toast(`エージェントの権限: ${((STATE.agent_modes || []).find((m) => m.id === value) || {}).label || value}`);
+    return true;
+  } catch (err) { toast(err.message); renderAgentBar(); return false; }
+}
+
+// ---- フォルダを選ぶ画面(PC の好きなフォルダ。新しいフォルダも作れる) ----
+let folderPick = null;
+const folderIcon = () => { const s = document.createElementNS("http://www.w3.org/2000/svg", "svg"); s.setAttribute("viewBox", "0 0 20 20");
+  s.innerHTML = '<path d="M2.5 5.5a1.5 1.5 0 0 1 1.5-1.5h3.4l1.8 2H16a1.5 1.5 0 0 1 1.5 1.5v7A1.5 1.5 0 0 1 16 16H4a1.5 1.5 0 0 1-1.5-1.5z"/>'; return s; };
+
+async function openFolderPicker({ current, onPick, title, hint }) {
+  folderPick = { onPick, path: "" };
+  $("folder-title").textContent = title || "作業するフォルダを選ぶ";
+  $("folder-hint").textContent = hint || "エージェントは、選んだフォルダの中で作業します(権限が「すべて許可」なら、外も扱えます)。";
+  $("folder-dialog").showModal();
+  await browseTo(current || "");
+}
+
+async function browseTo(path) {
+  let data;
+  try { data = await api("/api/browse?path=" + encodeURIComponent(path || "")); }
+  catch (e) { toast(e.message); if (path) return browseTo(""); return; }
+  folderPick.path = data.path;
+  $("folder-path").value = data.path;
+  $("folder-up").disabled = !data.parent;
+  $("folder-up").onclick = () => { if (data.parent) browseTo(data.parent); };
+  $("folder-roots").replaceChildren(...data.roots.map((r) => h("button", { type: "button", class: "chip" + (r.path === data.path ? " on" : "") + (r.kind === "recent" ? " recent" : ""),
+    title: r.path, onclick: () => browseTo(r.path) }, r.kind === "recent" ? "最近: " + r.label : r.label)));
+  const list = $("folder-list");
+  list.replaceChildren(...(data.folders.length
+    ? data.folders.map((f) => h("li", {}, h("button", { type: "button", title: f.path, onclick: () => browseTo(f.path) }, folderIcon(), h("span", {}, f.name))))
+    : [h("li", { class: "empty" }, data.path ? "この中にフォルダはありません" : "上の近道から選ぶか、場所を入力してください")]));
+  list.scrollTop = 0;
+  const warn = $("folder-warn");
+  warn.hidden = data.usable !== false;
+  warn.textContent = data.usable === false ? "ドライブ全体や Windows・プログラムのフォルダは、権限が「すべて許可」のときだけ選べます。" : "";
+  $("folder-use").disabled = !data.path || data.usable === false;
+  $("folder-new").hidden = !data.path;
+}
+$("folder-go").addEventListener("click", () => browseTo($("folder-path").value.trim()));
+$("folder-path").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); browseTo($("folder-path").value.trim()); } });
+$("folder-cancel").addEventListener("click", () => $("folder-dialog").close());
+$("folder-use").addEventListener("click", () => { const pick = folderPick; $("folder-dialog").close(); if (pick && pick.path && pick.onPick) pick.onPick(pick.path); });
+$("folder-default").addEventListener("click", () => { const pick = folderPick; $("folder-dialog").close(); if (pick && pick.onPick) pick.onPick(""); });
+$("folder-new-btn").addEventListener("click", async () => {
+  const name = $("folder-new-name").value.trim();
+  if (!name || !folderPick || !folderPick.path) return;
+  try { const r = await api("/api/browse/mkdir", { path: folderPick.path, name }); $("folder-new-name").value = ""; await browseTo(r.path); }
+  catch (e) { toast(e.message); }
+});
+$("folder-new-name").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); $("folder-new-btn").click(); } });
+
+// ---- エージェントの作業の様子(計画のチェックリストと、1手ごとの記録) ----
+function agentWork() {
+  const planBox = h("ol", { class: "plan" });
+  const list = h("ol", { class: "work" });
+  const el = h("div", { class: "agent-work", hidden: true },
+    h("div", { class: "plan-wrap", hidden: true }, h("div", { class: "work-head" }, "計画"), planBox),
+    h("div", { class: "work-head" }, "作業"), list);
+  let items = [];
+  return {
+    el,
+    plan(steps) {
+      if (!steps || !steps.length) return;
+      el.hidden = false;
+      el.querySelector(".plan-wrap").hidden = false;
+      items = steps.map((text) => h("li", { class: "todo" }, h("i", { class: "mark" }), h("span", {}, text)));
+      planBox.replaceChildren(...items);
+    },
+    step(ev) {
+      el.hidden = false;
+      if (ev.step && items.length) items.forEach((li, i) => { li.className = i + 1 < ev.step ? "done" : i + 1 === ev.step ? "doing" : li.className === "done" ? "done" : "todo"; });
+      list.querySelectorAll("li.running").forEach((li) => { li.className = "ok"; });
+      const out = h("details", { class: "out", hidden: true }, h("summary", {}, "結果"), h("pre", {}));
+      list.append(h("li", { class: "running", "data-n": ev.n }, h("i", { class: "mark" }),
+        h("div", { class: "body" },
+          h("div", { class: "line" }, h("b", {}, ev.label || ev.tool || ""), ev.detail ? h("code", {}, ev.detail) : null),
+          ev.thought ? h("div", { class: "thought" }, ev.thought) : null, out)));
+    },
+    result(ev) {
+      const li = list.querySelector(`li[data-n="${ev.n}"]`);
+      if (!li) return;
+      li.className = ev.ok ? "ok" : "fail";
+      const out = li.querySelector(".out");
+      if (ev.output) { out.hidden = false; out.querySelector("pre").textContent = ev.output; out.open = !ev.ok; }
+    },
+    finish(ok) {
+      if (ok) items.forEach((li) => { li.className = "done"; });
+      list.querySelectorAll("li.running").forEach((li) => { li.className = ok ? "ok" : "fail"; });
+    },
+  };
+}
+
+// 保存された会話の中の、エージェントの作業の記録
+function workLog(m) {
+  const calls = m.tool_calls || [];
+  if (!calls.length && !(m.plan || []).length) return null;
+  const work = agentWork();
+  work.plan(m.plan || []);
+  calls.forEach((c, i) => { work.step({ n: i + 1, label: c.label, detail: c.detail, thought: c.thought, step: c.step }); work.result({ n: i + 1, ok: c.ok }); });
+  work.finish(m.status === "done");
+  return h("details", { class: "work-log" }, h("summary", {}, `作業の記録(${calls.length} 手${(m.plan || []).length ? "・計画 " + m.plan.length + " 項目" : ""})`), work.el);
 }
 
 async function loadThreads() {
@@ -276,7 +413,8 @@ function renderThreads() {
     return;
   }
   list.replaceChildren(...threads.map((t) => h("button", {
-    type: "button", role: "listitem", class: "thread" + (t.id === currentId ? " on" : ""), onclick: () => openConversation(t.id),
+    type: "button", role: "listitem", class: "thread" + (t.id === currentId ? " on" : ""),
+    onclick: () => { openConversation(t.id).catch((e) => toast(e.message)); if (narrowScreen.matches) setThreads(false); },
   },
     h("div", { class: "thread-top" },
       t.pinned ? h("span", { class: "pin", title: "ピン留め" }) : null,
@@ -321,14 +459,15 @@ function renderHeader(conv) {
   const pin = h("button", { type: "button", class: "ghost small", onclick: async () => {
     try { await api("/api/conversations/" + conv.id, { pinned: !conv.pinned }); conv.pinned = !conv.pinned; renderHeader(conv); loadThreads(); } catch (e) { toast(e.message); }
   } }, conv.pinned ? "ピン留めを外す" : "ピン留め");
-  const exp = h("a", { class: "ghost small btn-link", href: `/api/conversations/${conv.id}/export`, download: (conv.title || "会話") + ".md" }, "書き出す");
+  const exp = h("a", { class: "ghost small btn-link", href: `/api/conversations/${conv.id}/export`, download: (conv.title || "会話") + ".md" }, "MD書き出し");
+  const expDoc = h("a", { class: "ghost small btn-link", href: `/api/conversations/${conv.id}/export?format=docx`, download: (conv.title || "会話") + ".docx" }, "Word書き出し");
   const del = h("button", { type: "button", class: "ghost small danger" }, "削除");
   let armed = false;
   del.addEventListener("click", async () => {
     if (!armed) { armed = true; del.textContent = "もう一度押すと削除"; setTimeout(() => { armed = false; del.textContent = "削除"; }, 3000); return; }
     try { await api("/api/conversations/" + conv.id, { deleted: true }); newConversation(); loadThreads(); toast("会話を削除しました"); } catch (e) { toast(e.message); }
   });
-  actions.replaceChildren(rename, pin, exp, del);
+  actions.replaceChildren(rename, pin, exp, expDoc, del);
 }
 
 function newConversation() {
@@ -339,7 +478,36 @@ function newConversation() {
   welcome();
   $("task").focus();
 }
-$("new-chat").addEventListener("click", newConversation);
+$("new-chat").addEventListener("click", () => { newConversation(); if (narrowScreen.matches) setThreads(false); });
+$("new-chat-mini").addEventListener("click", newConversation);
+
+// ---- 会話の一覧(引き出し): 広い画面では横に並べ、しまえる(しまったかどうかを覚える)。狭い画面では会話の上に重ねて出す ----
+function threadsShown() {
+  const view = $("view-chat");
+  return narrowScreen.matches ? view.classList.contains("threads-open") : !view.classList.contains("threads-closed");
+}
+function syncThreads() {
+  const open = threadsShown(), toggle = $("threads-toggle");
+  toggle.setAttribute("aria-expanded", String(open));
+  toggle.title = open ? "会話の一覧をしまう" : "会話の一覧を出す";
+  toggle.setAttribute("aria-label", toggle.title);
+  $("threads").inert = !open;  // しまっている間は、キーボードの移動でも入らない
+}
+function setThreads(open) {
+  const view = $("view-chat");
+  if (narrowScreen.matches) view.classList.toggle("threads-open", open);
+  else {
+    view.classList.toggle("threads-closed", !open);
+    try { localStorage.setItem("celestial-threads", open ? "open" : "closed"); } catch {}
+  }
+  syncThreads();
+}
+try { if (localStorage.getItem("celestial-threads") === "closed") $("view-chat").classList.add("threads-closed"); } catch {}
+syncThreads();
+$("threads-toggle").addEventListener("click", () => setThreads(!threadsShown()));
+$("threads-backdrop").addEventListener("click", () => setThreads(false));
+narrowScreen.addEventListener("change", () => { $("view-chat").classList.remove("threads-open"); syncThreads(); });
+document.addEventListener("keydown", (e) => { if (e.key === "Escape" && narrowScreen.matches && threadsShown()) setThreads(false); });
 
 function rateButtons(messageId, current) {
   const good = h("button", { type: "button", class: "rate good" + (current === 1 ? " on" : "") }, "良い");
@@ -366,8 +534,8 @@ function metaRow(message) {
     m.role ? h("span", { class: "tag accent" }, roleLabel(m.role)) : null,
     m.model ? h("span", { class: "tag" }, m.model) : null,
     m.examples_used ? h("span", { class: "tag gold" }, `手本 ${m.examples_used}件`) : null,
-    tools.length ? h("span", { class: "tag", title: tools.map((c) => `${c.label}: ${c.detail}${c.ok ? "" : "(失敗)"}`).join("\n") },
-      "道具: " + tools.map((c) => c.label + (c.ok ? "" : "(失敗)")).join(" → ")) : null,
+    tools.length ? h("span", { class: "tag wrap", title: tools.map((c) => `${c.label}: ${c.detail}${c.ok ? "" : "(失敗)"}`).join("\n") },
+      `道具 ${tools.length} 手: ` + toolChain(tools)) : null,
     m.subresults && m.subresults.length ? h("span", { class: "tag" }, "分担: " + m.subresults.map((s) => roleLabel(s.role)).join("・")) : null,
     m.escalated ? h("span", { class: "tag", title: m.escalated.confidence != null ? `最初の回答の確からしさ ${m.escalated.confidence.toFixed(3)}` : "" },
       m.escalated.reason === "lang" ? "日本語で答え直し"
@@ -417,6 +585,8 @@ function messageView(message) {
   if (message.content) renderMarkdown(answer, message.content);
   const box = h("div", { class: "msg ai", "data-id": message.id });
   if (m.status === "running") box.append(h("div", { class: "stage" }, h("i", { class: "dot" }), h("span", {}, "応答中…")));
+  const log = workLog(m);
+  if (log) box.append(log);
   box.append(answer);
   if ((m.changes || []).length) box.append(changesView(m.changes));
   if (m.memory_suggestion) box.append(memorySuggestion(message));
@@ -540,6 +710,10 @@ function stageText(ev) {
   if (s === "route") return `${roleLabel(ev.role)}の担当へ(${(ROUTE[ev.source] || [ev.source])[0]})`;
   if (s === "worker") return ev.agent ? `${ev.model} がエージェントとして作業中` : `${ev.model} が回答中` + (ev.examples ? `(手本 ${ev.examples}件を参照)` : "");
   if (s === "agent_step") return `[${ev.n}手目] ${ev.label}` + (ev.detail ? `(${ev.detail})` : "");
+  if (s === "agent_plan") return `計画を立てました(${ev.steps.length} 項目)`;
+  if (s === "agent_review") return (ev.about === "server" ? "起動したサーバーのページがエラーでした。直してから報告します: "
+    : "やり残しを見つけたので続けます: ") + (ev.missing || []).join("、");
+  if (s === "auto_agent") return "PC での作業が必要なため、エージェントが引き受けます…";
   if (s === "verify") return "管理AIが回答を検証中…";
   if (s === "retry") return ev.issue ? `${ev.model} が${ev.issue}中` : `検証で問題が見つかったため ${ev.model} が再回答中`;
   if (s === "escalate") return ev.reason === "lang" ? `言語を取り違えたため ${ev.model} が答え直し中` : `確からしさが低いため ${ev.model} が答え直し中`;
@@ -570,9 +744,9 @@ async function sendMessage(task) {
   attachments.forEach((a) => { if (a.url) URL.revokeObjectURL(a.url); }); attachments = []; renderAttachments();
   const stageLabel = h("span", {}, "キャッシュと担当を確認中…");
   const stage = h("div", { class: "stage" }, h("i", { class: "dot" }), stageLabel);
-  const steps = h("ol", { class: "steps" });
+  const work = agentWork();
   const answer = h("div", { class: "answer" });
-  const msg = h("div", { class: "msg ai" }, stage, steps, answer);
+  const msg = h("div", { class: "msg ai" }, stage, work.el, answer);
   box.append(msg);
   scrollDown(true);
 
@@ -594,7 +768,9 @@ async function sendMessage(task) {
       if (!pending) { pending = true; requestAnimationFrame(paint); }
     } else if (ev.type === "stage") {
       if (ev.stage === "retry") { buffer = ""; skipNext = true; }
-      if (ev.stage === "agent_step") steps.append(h("li", { "data-n": ev.n }, h("b", {}, ev.label), ev.detail ? h("span", {}, ev.detail) : null));
+      if (ev.stage === "agent_plan") work.plan(ev.steps);
+      if (ev.stage === "agent_step") work.step(ev);
+      if (ev.stage === "agent_result") work.result(ev);
       const text = stageText(ev);
       if (text) stageLabel.textContent = text;
       scrollDown();
@@ -605,6 +781,8 @@ async function sendMessage(task) {
     } else if (ev.type === "done") {
       finished = true;
       stage.remove();
+      work.finish(true);
+      if ((ev.message.meta || {}).changes && ev.message.meta.changes.length) msg.insertBefore(changesView(ev.message.meta.changes), answer.nextSibling);
       buffer = ev.message.content;
       renderMarkdown(answer, buffer);
       msg.dataset.id = ev.message.id;
@@ -612,6 +790,7 @@ async function sendMessage(task) {
     } else if (ev.type === "error" || ev.type === "cancelled") {
       finished = true;
       stage.remove();
+      work.finish(false);
       if (ev.type === "error") { answer.classList.add("error"); answer.textContent = ev.message; }
       else msg.append(h("div", { class: "meta" }, "停止しました"));
     }
@@ -623,7 +802,7 @@ async function sendMessage(task) {
       body: JSON.stringify({
         task, conversation_id: currentId, role: $("opt-role").value, context: $("opt-context").value,
         verify: pressed("opt-verify"), swarm: pressed("opt-swarm") ? "on" : "auto", agent: pressed("opt-agent"), images,
-        folder: pressed("opt-agent") ? $("opt-folder").value : "",
+        folder: selectedFolder,
       }),
     });
     if (!res.ok) throw new Error((await res.json()).error || "エラーが発生しました");
@@ -788,9 +967,16 @@ async function loadLearn() {
 // ---- 計測 ----
 let benchTimer = null;
 $("bench-code").addEventListener("change", () => ($("bench-code-note").hidden = !$("bench-code").checked));
+function syncBenchKind() {
+  const agent = $("bench-kind").value === "agent";
+  $("bench-agent-note").hidden = !agent;
+  for (const id of ["bench-code", "bench-verify"]) $(id).closest("label").hidden = agent;
+  $("bench-code-note").hidden = agent || !$("bench-code").checked;
+}
+$("bench-kind").addEventListener("change", syncBenchKind);
 $("bench-start").addEventListener("click", async () => {
   try {
-    await api("/api/bench", { model: $("bench-model").value, run_code: $("bench-code").checked, verify: $("bench-verify").checked });
+    await api("/api/bench", { kind: $("bench-kind").value, model: $("bench-model").value, run_code: $("bench-code").checked, verify: $("bench-verify").checked });
     loadBench();
   } catch (e) { toast(e.message); }
 });
@@ -801,7 +987,8 @@ function renderBenchJob(job) {
   $("bench-start").textContent = job.running ? "計測中…" : "計測を始める";
   if (!job.running && !job.report && !job.error) { box.replaceChildren(); return; }
   const done = job.outcomes.length, total = job.total || done || 1, ok = job.outcomes.filter((o) => o.ok).length;
-  const title = job.running ? `計測中: ${job.label === "auto" ? "自動" : job.label}` : job.error ? "計測は中断されました" : `今回の結果: ${job.label === "auto" ? "自動" : job.label}`;
+  const what = (job.kind === "agent" ? "エージェント " : "") + (job.label === "auto" ? "自動" : job.label);
+  const title = job.running ? `計測中: ${what}` : job.error ? "計測は中断されました" : `今回の結果: ${what}`;
   const panel = h("div", { class: "panel" }, h("h2", {}, title, h("small", {}, `${done} / ${job.total || "?"} 件、正解 ${ok}`)),
     h("div", { class: "progress" }, h("i", { style: `width:${(done / total) * 100}%` })),
     h("div", { class: "dots" }, job.outcomes.map((o) => h("i", { class: o.ok ? "ok" : "ng", title: `${o.id}: ${o.ok ? "正解" : "不正解"}(${o.model}、${secs(o.latency_s)})` }))));
@@ -809,9 +996,10 @@ function renderBenchJob(job) {
   if (job.report) {
     const r = job.report;
     panel.append(h("div", { class: "kpis" },
-      kpi("正解率", pct(r.accuracy), "", `${r.correct} / ${r.n} 件`),
-      kpi("振り分けの正解", r.route_n ? pct(r.route_correct / r.route_n) : "-", "", `${r.route_correct} / ${r.route_n} 件`),
-      kpi("平均トークン", num(r.avg_tokens)), kpi("平均所要時間", r.avg_latency_s.toFixed(1), "秒")),
+      kpi(job.kind === "agent" ? "作業の成功率" : "正解率", pct(r.accuracy), "", `${r.correct} / ${r.n} 件`),
+      ...(job.kind === "agent" ? [] : [kpi("振り分けの正解", r.route_n ? pct(r.route_correct / r.route_n) : "-", "", `${r.route_correct} / ${r.route_n} 件`),
+        kpi("平均トークン", num(r.avg_tokens))]),
+      kpi("平均所要時間", r.avg_latency_s.toFixed(1), "秒")),
       h("div", { class: "meta" }, Object.entries(r.by_role).map(([role, [c, n]]) => h("span", { class: "tag " + (c === n ? "good" : c / n < 0.5 ? "bad" : "") }, `${roleLabel(role)} ${c}/${n}`))));
     if (r.skipped) panel.append(h("p", { class: "note" }, `コードの課題 ${r.skipped} 件は対象外でした(「コードの課題も採点する」で含められます)。`));
   }
@@ -830,10 +1018,10 @@ async function loadBench() {
       h("thead", {}, h("tr", {}, h("th", {}, "日時"), h("th", {}, "対象"), h("th", {}, "正解率"), h("th", { class: "num" }, "振り分け"), h("th", { class: "num" }, "平均トークン"), h("th", { class: "num" }, "平均秒"), h("th", {}, "課題集"))),
       h("tbody", {}, rows.map((r) => h("tr", {},
         h("td", {}, new Date(r.ts * 1000).toLocaleString("ja-JP", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" })),
-        h("td", {}, r.label === "auto" ? "自動" : r.label),
+        h("td", {}, r.label === "auto" ? "自動" : r.label.startsWith("agent:") ? `エージェント(${r.label.slice(6)})` : r.label),
         h("td", {}, h("div", { class: "meter" }, h("div", { class: "progress" }, h("i", { style: `width:${(r.correct / r.n) * 100}%` })), `${pct(r.correct / r.n)} (${r.correct}/${r.n})`)),
         h("td", { class: "num" }, r.route_n ? `${r.route_correct}/${r.route_n}` : "-"),
-        h("td", { class: "num" }, num(r.avg_tokens)), h("td", { class: "num" }, r.avg_latency_s.toFixed(1)),
+        h("td", { class: "num" }, r.avg_tokens ? num(r.avg_tokens) : "-"), h("td", { class: "num" }, r.avg_latency_s.toFixed(1)),
         h("td", {}, h("span", { class: "path" }, r.suite)))))))
       : h("p", { class: "empty" }, "まだ計測結果がありません。「計測を始める」で最初の基準値を取りましょう。")));
 }
@@ -850,46 +1038,134 @@ async function refreshOwn() {
   let own;
   try { own = await api("/api/own"); } catch (e) { toast(e.message); return; }
   const job = own.job, busy = job.running;
+  const keepRole = $("own-per-role") ? $("own-per-role").value : null;
+  const keepProfile = $("own-profile") ? $("own-profile").value : null;
+  const keepPreset = $("own-preset") ? $("own-preset").value : null;
+  const keepQuant = $("own-quantize") ? $("own-quantize").value : null;
+
   const perRole = h("select", { id: "own-per-role", "aria-label": "担当ごとの問題数" }, [10, 20, 30].map((n) => h("option", { value: n }, `担当ごとに${n}問`)));
+  const profileEntries = Object.entries(own.profiles || {});
+  const profileSel = h("select", { id: "own-profile", "aria-label": "自作AIの種類" }, [
+    ...profileEntries.map(([k, p]) => h("option", { value: k }, p.label)),
+    h("option", { value: "" }, "カスタム (基礎モデル直接選択)"),
+  ]);
+  const defaultProfile = profileEntries.length ? (own.profiles.pro ? "pro" : profileEntries[0][0]) : "";
+  profileSel.value = keepProfile !== null ? keepProfile : defaultProfile;
+
+  const presetEntries = Object.entries(own.presets || {});
+  const presetSel = h("select", { id: "own-preset", "aria-label": "基礎モデル" }, presetEntries.map(([k, p]) =>
+    h("option", { value: k }, p.label + (p.base === own.recommended_base ? " ★" : ""))));
+  const defaultPreset = (presetEntries.find(([, p]) => p.base === own.recommended_base) || presetEntries[0] || ["0.5b"])[0];
+  presetSel.value = keepPreset || defaultPreset;
+
+  const quantSel = h("select", { id: "own-quantize", "aria-label": "量子化" }, [
+    h("option", { value: "q8_0" }, "高精度 (q8_0)"),
+    h("option", { value: "q4_k_m" }, "省メモリ・高速 (q4_k_m)"),
+    h("option", { value: "f16" }, "無圧縮 (f16)"),
+  ]);
+  const profileNote = h("p", { class: "note" });
+  const syncProfileUI = (autoQuant = false) => {
+    const pid = profileSel.value;
+    const spec = pid && own.profiles ? own.profiles[pid] : null;
+    presetSel.hidden = Boolean(spec);
+    if (spec) {
+      const is3b = /3B/i.test(spec.base || "");
+      if (autoQuant) quantSel.value = is3b ? "q4_k_m" : "q8_0";
+      const rolesTxt = (spec.specialties || []).join(" / ") || "全役割";
+      profileNote.textContent = `${spec.desc} (得意: ${rolesTxt}${spec.can_manage ? "・管理AI可" : ""})`;
+    } else {
+      if (autoQuant) quantSel.value = presetSel.value.includes("3b") ? "q4_k_m" : "q8_0";
+      profileNote.textContent = "選択した基礎モデルで全分野を学習します。";
+    }
+  };
+  quantSel.value = keepQuant || (profileSel.value && own.profiles && /3B/i.test((own.profiles[profileSel.value] || {}).base || "") ? "q4_k_m" : "q8_0");
+  syncProfileUI(keepQuant === null);
+  profileSel.onchange = () => syncProfileUI(true);
+  presetSel.onchange = () => {
+    quantSel.value = presetSel.value.includes("3b") ? "q4_k_m" : "q8_0";
+  };
+
+  const roleSummary = Object.entries(own.role_counts || {}).map(([r, n]) => `${r}:${n}`).join(" / ");
+  const weakNote = (own.weak_roles || []).length ? `苦手優先: ${own.weak_roles.slice(0, 3).join(" → ")}` : "";
   const parts = [
-    h("h2", {}, "自作AI", h("small", {}, "小さな基礎モデルに、良い回答と自習の成果を教え込みます")),
-    h("div", { class: "meta" }, h("span", {}, "学習に使えるデータ"), h("span", { class: "sep" }), h("span", {}, `${own.examples} 件(うち自習 ${own.study} 件)`)),
+    h("h2", {}, "自作AI", h("small", {}, "多様な特化型AI・汎用AIに検算問題・Wikipedia知識・DPO選好ペアを LoRA+ + KL正則化で学習させます")),
+    h("div", { class: "meta" },
+      h("span", {}, "学習データ"), h("span", { class: "sep" }),
+      h("span", {}, `${own.examples} 件(自習 ${own.study} 件 / 選好ペア ${own.preferences || 0} 件)`),
+      weakNote ? h("span", { class: "sep" }) : null,
+      weakNote ? h("span", {}, weakNote) : null),
   ];
+  if (roleSummary) parts.push(h("p", { class: "note" }, "役割別自習データ: " + roleSummary));
   if (!own.available) parts.push(h("p", { class: "note" }, "学習と自作AIの利用には追加のライブラリが必要です。"), h("pre", { class: "path" }, own.install_hint));
   parts.push(h("div", { class: "composer-row" },
     perRole,
-    h("button", { type: "button", class: "ghost", disabled: busy, onclick: () => startWork("/api/study", { per_role: Number(perRole.value) }) }, "自習する"),
+    h("button", { type: "button", class: "ghost", disabled: busy, onclick: () => startWork("/api/study", {
+      per_role: Number(perRole.value), focus_weak: true, synthetic: 40, wiki: 20, contrastive: true,
+    }) }, "自習する"),
+    h("button", { type: "button", class: "ghost", disabled: busy || !own.study, onclick: () => startWork("/api/study/review", {}) }, "データ見直し"),
+    profileSel,
+    presetSel,
+    quantSel,
     h("span", { class: "grow" }),
-    h("button", { type: "button", class: "primary", disabled: busy || !own.available || own.examples < 8, onclick: () => startWork("/api/train", {}) }, "学習を始める")));
-  parts.push(h("p", { class: "note" }, "自習では、計測で最も正確だったAIが練習問題を作って解き、それが学習データになります。学習が終わると自動で精度を計測し、結果が担当選びに反映されます。"));
+    h("button", { type: "button", class: "ghost", disabled: busy || !own.available || own.examples < 8, onclick: () => startWork("/api/train",
+      profileSel.value
+        ? { profile: profileSel.value, quantize: quantSel.value, run_code: true }
+        : { preset: presetSel.value, quantize: quantSel.value, run_code: true }
+    ) }, "学習のみ"),
+    h("button", { type: "button", class: "primary", disabled: busy || !own.available, onclick: () => startWork("/api/evolve",
+      profileSel.value
+        ? { profile: profileSel.value, quantize: quantSel.value, study_per_role: 8, synthetic: 40, wiki: 24, run_code: true }
+        : { preset: presetSel.value, quantize: quantSel.value, study_per_role: 8, synthetic: 40, wiki: 24, run_code: true }
+    ) }, "自動進化")));
+  parts.push(profileNote);
+  parts.push(h("p", { class: "note" }, "「自動進化」はデータ見直し・苦手分野中心の自習と検算/Wikipedia問題生成・LoRA+/KL/DPO学習・計測をすべて自動で行います。"));
+
+  const kindLabel = { study: "自習中: ", review: "データ見直し中: ", evolve: "自動進化中: ", train: "学習中: ", calibrate: "較正中: " };
   if (busy) {
-    parts.push(h("div", {}, h("div", { class: "meta" }, h("span", {}, (job.kind === "study" ? "自習中: " : "学習中: ") + job.message), h("span", { class: "sep" }), h("span", {}, job.total ? `${job.done} / ${job.total}` : "")),
+    parts.push(h("div", {}, h("div", { class: "meta" }, h("span", {}, (kindLabel[job.kind] || "実行中: ") + job.message), h("span", { class: "sep" }), h("span", {}, job.total ? `${job.done} / ${job.total}` : "")),
       h("div", { class: "progress" }, h("i", { style: `width:${job.total ? (job.done / job.total) * 100 : 3}%` }))));
   } else if (job.error) {
     parts.push(h("p", { class: "answer error", style: "white-space:pre-wrap" }, job.error));
   } else if (job.result) {
     const r = job.result;
-    parts.push(h("p", { class: "tag good", style: "align-self:flex-start" }, job.kind === "study"
-      ? `${r.teacher} が ${r.added} 件の練習問題を解きました`
-      : `${r.name} を作成しました(${num(r.seconds)}秒、計測 ${r.bench_correct}/${r.bench_n} 正解`
-        + (r.base_n ? `、学習前の基礎モデルは ${r.base_correct}/${r.base_n}` : "") + ")"));
-    if (job.kind === "train" && r.export_error) parts.push(h("p", { class: "note" }, "Ollama への書き出しはできませんでした: " + r.export_error));
+    let msg = "";
+    if (job.kind === "study") {
+      msg = `${r.teacher} 等が ${r.added} 件(+自動検算 ${r.synthetic_added || 0} / Wikipedia ${r.wiki_added || 0} / 選好 ${r.preferences_added || 0})を追加しました`;
+    } else if (job.kind === "review") {
+      msg = `${r.checked} 件を見直し、不要な ${r.removed} 件を削除・${r.cleaned || 0} 件を整形しました`;
+    } else if (r.name) {
+      msg = `${r.name} を作成しました(${num(r.seconds)}秒、計測 ${r.bench_correct}/${r.bench_n} 正解`
+        + (r.base_n ? `、基礎モデル ${r.base_correct}/${r.base_n}` : "") + ")";
+    }
+    if (msg) parts.push(h("p", { class: "tag good", style: "align-self:flex-start" }, msg));
+    if ((job.kind === "train" || job.kind === "evolve") && r.export_error) {
+      parts.push(h("p", { class: "note" }, "Ollama への書き出しはできませんでした: " + r.export_error));
+    }
   }
   if (own.models.length) {
     parts.push(h("div", { class: "table-wrap" }, h("table", {},
-      h("thead", {}, h("tr", {}, h("th", {}, "名前"), h("th", {}, "基礎モデル"), h("th", { class: "num" }, "学習データ"), h("th", { class: "num" }, "検証損失(前→後)"), h("th", { class: "num" }, "学習時間"), h("th", {}, "作成"))),
+      h("thead", {}, h("tr", {}, h("th", {}, "名前"), h("th", {}, "基礎モデル"), h("th", { class: "num" }, "学習データ"), h("th", { class: "num" }, "検証損失(前→後)"), h("th", { class: "num" }, "計測"), h("th", { class: "num" }, "学習時間"), h("th", {}, "作成"), h("th", {}, ""))),
       h("tbody", {}, own.models.slice().reverse().map((m) => h("tr", {},
-        h("td", {}, m.name, m.ollama ? h("span", { class: "tag", style: "margin-left:6px" }, "Ollama") : null), h("td", {}, h("span", { class: "path" }, m.base)),
-        h("td", { class: "num" }, m.adapter === false ? "学習前" : `${m.examples} 件`),
-        h("td", { class: "num" }, m.eval_loss == null ? "-" : `${m.base_eval_loss} → ${m.eval_loss}`), h("td", { class: "num" }, secs(m.seconds)),
-        h("td", {}, new Date(m.created * 1000).toLocaleString("ja-JP", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }))))))));
+        h("td", {}, m.name,
+          m.profile ? h("span", { class: "tag", style: "margin-left:6px" }, m.profile) : null,
+          m.can_manage ? h("span", { class: "tag good", style: "margin-left:6px" }, "管理可") : null,
+          m.ollama ? h("span", { class: "tag", style: "margin-left:6px" }, m.quantize ? `Ollama/${m.quantize}` : "Ollama") : null,
+          Array.isArray(m.specialties) && m.specialties.length ? h("div", { class: "note" }, "得意: " + m.specialties.join(", ")) : null),
+        h("td", {}, h("span", { class: "path" }, m.base)),
+        h("td", { class: "num" }, m.adapter === false ? "学習前" : `${m.examples} 件` + (m.preference_steps ? ` (+DPO ${m.preference_steps})` : "")),
+        h("td", { class: "num" }, m.eval_loss == null ? "-" : `${m.base_eval_loss} → ${m.eval_loss}`),
+        h("td", { class: "num" }, m.bench ? `${m.bench.correct}/${m.bench.n}` : "-"),
+        h("td", { class: "num" }, secs(m.seconds)),
+        h("td", {}, new Date(m.created * 1000).toLocaleString("ja-JP", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" })),
+        h("td", {}, h("button", { type: "button", class: "ghost", disabled: busy, onclick: async () => {
+          try { await api("/api/own/delete", { name: m.name }); refreshOwn(); loadSettings(); } catch (e) { toast(e.message); }
+        } }, "削除"))))))));
   }
-  const keep = $("own-per-role") ? $("own-per-role").value : null;
   panel.replaceChildren(...parts);
-  if (keep) perRole.value = keep;
+  if (keepRole) perRole.value = keepRole;
   clearTimeout(ownTimer);
   if (busy && !$("view-settings").hidden) ownTimer = setTimeout(refreshOwn, 1500);
-  else if (!busy && job.kind === "train" && job.result && !STATE.models.some((m) => m.name === job.result.model)) loadSettings();
+  else if (!busy && (job.kind === "train" || job.kind === "evolve") && job.result && !STATE.models.some((m) => m.name === job.result.model)) loadSettings();
 }
 
 function switchRow(key, title, desc) {
@@ -900,6 +1176,30 @@ function switchRow(key, title, desc) {
     catch (e) { toast(e.message); }
   });
   return h("div", { class: "setting" }, h("b", {}, title), h("p", {}, desc), h("div", { class: "ctl" }, sw));
+}
+
+function modeChooser() {
+  const current = STATE.settings.agent_mode || "auto";
+  const box = h("div", { class: "modes", role: "radiogroup", "aria-label": "エージェントの権限" });
+  for (const mode of STATE.agent_modes || []) {
+    const btn = h("button", { type: "button", role: "radio", "aria-checked": String(mode.id === current), class: "mode" + (mode.id === "full" ? " danger" : "") },
+      h("i", { class: "radio" }), h("span", { class: "mode-text" }, h("b", {}, mode.label), h("span", {}, mode.description)));
+    btn.addEventListener("click", async () => { if (mode.id !== (STATE.settings.agent_mode || "auto") && await setMode(mode.id)) loadSettings(); });
+    box.append(btn);
+  }
+  return h("div", { class: "setting column" }, h("b", {}, "権限のモード"),
+    h("p", {}, "弱い順に並んでいます。会話画面の入力欄の下でも切り替えられます。最大の「すべて許可」は、すべてのコマンド・編集を確認なしで行います。"), box);
+}
+
+function processesPanel() {
+  const list = STATE.processes || [];
+  return h("div", { class: "setting column" }, h("b", {}, "動作中のプログラム"),
+    list.length ? h("div", { class: "procs" }, list.map((p) => h("div", { class: "proc" },
+      h("code", {}, p.command), h("span", { class: "note" }, `PID ${p.pid}`),
+      h("button", { type: "button", class: "ghost small", onclick: async () => {
+        try { await api("/api/processes/stop", { name: p.name }); toast("止めました"); loadSettings(); } catch (e) { toast(e.message); }
+      } }, "止める"))))
+      : h("p", {}, "エージェントが起動して動かし続けているプログラム(サーバーなど)はありません。"));
 }
 
 // あなたに合わせる: AIへの指示と、覚えていること(スマホの中のAIにも同期される)
@@ -938,6 +1238,97 @@ function personalPanel() {
       h("div", { class: "field-row" }, fact, h("button", { type: "button", class: "ghost", onclick: addFact }, "覚える"))));
 }
 
+async function loadKb() {
+  const data = await api("/api/kb");
+  const st = data.stats || { docs: 0, chunks: 0, embedded: 0 };
+  const docs = data.docs || [];
+
+  const qIn = h("input", { type: "text", class: "text-input", placeholder: "キーワードや質問で検索…", "aria-label": "知識ベースを検索" });
+  const hitsBox = h("div", { class: "kb-hits" });
+  const doSearch = async () => {
+    const query = qIn.value.trim();
+    if (!query) { hitsBox.replaceChildren(); return; }
+    try {
+      const res = await api("/api/kb/search", { query, top_k: 6 });
+      const hits = res.hits || [];
+      if (!hits.length) { hitsBox.replaceChildren(h("p", { class: "note" }, "該当する箇所は見つかりませんでした。")); return; }
+      hitsBox.replaceChildren(hits.map((hit) => h("div", { class: "kb-hit" },
+        h("div", { class: "kb-hit-head" }, h("b", {}, hit.title), h("span", { class: "tag accent" }, `一致度 ${hit.score.toFixed(2)}`),
+          h("span", { class: "path" }, hit.source)),
+        h("p", { class: "kb-hit-text" }, hit.text))));
+    } catch (e) { toast(e.message); }
+  };
+  qIn.addEventListener("keydown", (e) => { if (e.key === "Enter") doSearch(); });
+
+  const noteTitle = h("input", { type: "text", class: "text-input", placeholder: "題名(例: 社内ルール・メモ)" });
+  const noteText = h("textarea", { rows: 4, class: "text-input", placeholder: "覚えておいてほしい仕様・手順・メモなど…" });
+  const addNoteBtn = h("button", { type: "button", class: "primary", onclick: async () => {
+    if (!noteTitle.value.trim() || !noteText.value.trim()) return toast("題名と内容を入力してください");
+    try { await api("/api/kb/add", { kind: "note", title: noteTitle.value.trim(), text: noteText.value.trim() }); toast("メモを登録しました"); loadKb(); }
+    catch (e) { toast(e.message); }
+  } }, "メモを登録");
+
+  const pathIn = h("input", { type: "text", class: "text-input", placeholder: "ファイルやフォルダのパス(Word / Excel / PPTX / PDF / コード等)" });
+  const pickDir = h("button", { type: "button", class: "ghost", onclick: () => openFolderPicker({
+    current: STATE && STATE.workspace_root, title: "取り込むフォルダを選ぶ",
+    hint: "フォルダ内の文書・テキスト・PDF をまとめて知識ベースに取り込みます。",
+    onPick: (p) => { pathIn.value = p; },
+  }) }, "選ぶ");
+  const addFileBtn = h("button", { type: "button", class: "ghost", onclick: async () => {
+    if (!pathIn.value.trim()) return toast("パスを入力してください");
+    try { await api("/api/kb/add", { kind: "file", path: pathIn.value.trim() }); toast("ファイルを取り込みました"); loadKb(); }
+    catch (e) { toast(e.message); }
+  } }, "ファイル登録");
+  const addDirBtn = h("button", { type: "button", class: "ghost", onclick: async () => {
+    if (!pathIn.value.trim()) return toast("パスを入力してください");
+    addDirBtn.disabled = true;
+    try { const r = await api("/api/kb/add", { kind: "folder", path: pathIn.value.trim() }); toast(`${r.result.indexed} 件取り込みました`); loadKb(); }
+    catch (e) { toast(e.message); }
+    finally { addDirBtn.disabled = false; }
+  } }, "フォルダ一括登録");
+
+  const urlIn = h("input", { type: "url", class: "text-input", placeholder: "https://... 公開ウェブページの URL" });
+  const addUrlBtn = h("button", { type: "button", class: "ghost", onclick: async () => {
+    if (!urlIn.value.trim()) return toast("URL を入力してください");
+    addUrlBtn.disabled = true;
+    try { await api("/api/kb/add", { kind: "url", url: urlIn.value.trim() }); toast("ページを取り込みました"); loadKb(); }
+    catch (e) { toast(e.message); }
+    finally { addUrlBtn.disabled = false; }
+  } }, "URL 登録");
+
+  $("kb-body").replaceChildren(
+    h("div", { class: "panel" }, h("h2", {}, "現在の知識ベース",
+      h("small", {}, data.embed_model ? `意味検索有効 (${data.embed_model})` : "文字検索モード (Ollama に bge-m3 などを入れると意味検索が有効になります)")),
+      h("div", { class: "kpis" },
+        kpi("登録資料", num(st.docs), "件"),
+        kpi("検索チャンク", num(st.chunks), "片"),
+        kpi("ベクトル化済み", num(st.embedded), "片"))),
+    h("div", { class: "panel" }, h("h2", {}, "資料を探す"),
+      h("div", { class: "composer-row" }, qIn, h("button", { type: "button", class: "primary", onclick: doSearch }, "検索")),
+      hitsBox),
+    h("div", { class: "kb-grid" },
+      h("div", { class: "panel" }, h("h2", {}, "メモ・資料を追加"),
+        h("div", { class: "kb-form" }, noteTitle, noteText, addNoteBtn)),
+      h("div", { class: "panel" }, h("h2", {}, "PC のファイル / URL を取り込む"),
+        h("div", { class: "kb-form" },
+          h("div", { class: "composer-row" }, pathIn, pickDir),
+          h("div", { class: "row" }, addFileBtn, addDirBtn),
+          h("div", { class: "composer-row" }, urlIn, addUrlBtn)))),
+    h("div", { class: "panel" }, h("h2", {}, "登録済みの資料", h("small", {}, `${docs.length}件`)),
+      docs.length
+        ? h("div", { class: "kb-docs" }, docs.map((d) => h("div", { class: "kb-doc" },
+            h("div", { class: "kb-doc-main" },
+              h("span", { class: "tag" }, d.kind),
+              h("b", {}, d.title),
+              h("span", { class: "tag" }, `${d.chunks}片`),
+              h("span", { class: "path" }, d.source)),
+            h("button", { type: "button", class: "ghost small danger", onclick: async () => {
+              try { await api("/api/kb/delete", { id: d.id }); toast("削除しました"); loadKb(); } catch (e) { toast(e.message); }
+            } }, "削除"))))
+        : h("p", { class: "note" }, "まだ登録された資料はありません。上のフォームや CLI (`celestial kb add ...`) から追加できます。")),
+  );
+}
+
 async function loadSettings() {
   await loadState();
   const tier = { small: "小型", medium: "中型", large: "大型" };
@@ -952,13 +1343,29 @@ async function loadSettings() {
     try { await api("/api/settings", { fewshot_k: Number.parseInt(fewshot.value, 10) }); toast("保存しました"); } catch (e) { toast(e.message); }
   });
   const exportOut = h("p", { class: "path" });
-  const workspace = h("input", { type: "text", id: "set-workspace", value: STATE.settings.workspace || "", placeholder: "例: C:\\Users\\you\\Documents\\notes",
-    "aria-label": "作業フォルダ", style: "flex:1;min-width:0;background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:6px 10px;font-size:13px" });
-  const saveWorkspace = async () => {
-    try { await api("/api/settings", { workspace: workspace.value.trim() }); toast(workspace.value.trim() ? "作業フォルダを設定しました" : "作業フォルダを解除しました"); loadSettings(); }
-    catch (e) { toast(e.message); }
+  const workspace = h("input", { type: "text", id: "set-workspace", value: STATE.settings.workspace || "", placeholder: STATE.default_workspace || "",
+    "aria-label": "作業フォルダ", class: "text-input" });
+  const saveWorkspace = async (value) => {
+    try {
+      await api("/api/settings", { workspace: value });
+      toast(value ? "作業フォルダを設定しました" : `既定の作業フォルダ(${STATE.default_workspace})に戻しました`);
+      loadSettings();
+    } catch (e) { toast(e.message); }
   };
-  workspace.addEventListener("keydown", (e) => { if (e.key === "Enter") saveWorkspace(); });
+  workspace.addEventListener("keydown", (e) => { if (e.key === "Enter") saveWorkspace(workspace.value.trim()); });
+  const pickWorkspace = () => openFolderPicker({ current: STATE.workspace_root, title: "既定の作業フォルダを選ぶ",
+    hint: "エージェントが作ったものや、フォルダを指定しない依頼の作業は、ここで行います。", onPick: (path) => saveWorkspace(path) });
+  const agentModel = h("select", { "aria-label": "エージェントのAI" }, h("option", { value: "auto" }, "自動(正確さと速さで選ぶ)"),
+    STATE.models.map((m) => h("option", { value: m.name }, m.name)));
+  agentModel.value = STATE.settings.agent_model || "auto";
+  agentModel.addEventListener("change", async () => {
+    try { await api("/api/settings", { agent_model: agentModel.value }); toast("エージェントのAIを変更しました"); } catch (e) { toast(e.message); }
+  });
+  const maxSteps = h("input", { type: "number", min: 5, max: 200, value: STATE.settings.tools_max_steps || 30, "aria-label": "手数の上限" });
+  maxSteps.addEventListener("change", async () => {
+    try { await api("/api/settings", { tools_max_steps: Number.parseInt(maxSteps.value, 10) }); toast("保存しました"); } catch (e) { toast(e.message); }
+  });
+  const full = STATE.settings.agent_mode === "full";
   $("settings-body").replaceChildren(
     personalPanel(),
     h("div", { class: "panel" }, h("h2", {}, "利用できるAI", h("small", {}, "Ollama に入っているモデルを自動で検出します")),
@@ -973,21 +1380,31 @@ async function loadSettings() {
         h("div", { class: "setting" }, h("b", {}, "管理AI"), h("p", {}, "タスクの振り分け・分解・検証を担当するAIです。"), h("div", { class: "ctl" }, manager)),
         switchRow("cache", "キャッシュ", "同じタスクには、以前の回答を計算なしで返します。"),
         switchRow("learned_routing", "振り分けの学習", "管理AIの振り分けを覚え、自信のあるタスクは管理AIを呼ばずに振り分けます。"),
+        switchRow("use_kb", "知識ベースを参照 (RAG)", "登録した資料・メモから関連箇所を探して、質問の文脈として AI に渡します。"),
         switchRow("semantic_search", "意味で手本を探す", STATE.embed_model
           ? `言い回しが違っても同じ趣旨の過去の回答を手本にします(埋め込みモデル: ${STATE.embed_model})。`
           : "埋め込みモデルが見つからないため、文字の近さで探しています。Ollama に bge-m3 などを入れると有効になります。"),
         switchRow("swarm_auto", "自動で分担", "長く複合的なタスクを、管理AIの判断で分解して複数のAIに分担させます。"),
         switchRow("cascade", "自信のない回答は答え直す", "速いAIの回答の出だしを確かめ、自信がない・言語を取り違えたときは、計測で最も正確なAIが答え直します。答え直す境目は、精度の計測結果から学びます。"),
         h("div", { class: "setting" }, h("b", {}, "手本の件数"), h("p", {}, "「良い」と評価した過去の回答を、似たタスクの手本として何件まで渡すか(0で無効)。"), h("div", { class: "ctl" }, fewshot)))),
-    h("div", { class: "panel" }, h("h2", {}, "エージェントの道具", h("small", {}, "会話画面で「エージェント」をオンにしたときに使われます")),
-      h("p", { class: "note" }, "計算と、専門のAIへの依頼はいつでも使えます。作業フォルダを設定すると、その中のファイルを扱えます(フォルダの外には届きません)。ファイルを書き換える・消す前には、必ずバックアップを取ります。"),
-      h("div", { class: "composer-row" }, workspace, h("button", { type: "button", class: "ghost", onclick: saveWorkspace }, "設定")),
+    h("div", { class: "panel" }, h("h2", {}, "エージェント", h("small", {}, "ファイル・フォルダ・コマンドの依頼は、切り替えなくてもエージェントが引き受けます")),
+      modeChooser(),
+      h("div", { class: "setting column" }, h("b", {}, "既定の作業フォルダ"),
+        h("p", {}, `フォルダを指定しない依頼の作業場所です。空なら ${STATE.default_workspace} を使います。会話ごとに、入力欄の下のフォルダから PC の好きなフォルダを選べます。`),
+        h("div", { class: "composer-row" }, workspace,
+          h("button", { type: "button", class: "ghost", onclick: pickWorkspace }, "選ぶ"),
+          h("button", { type: "button", class: "ghost", onclick: () => saveWorkspace(workspace.value.trim()) }, "設定"),
+          STATE.settings.workspace ? h("button", { type: "button", class: "ghost", onclick: () => saveWorkspace("") }, "既定に戻す") : null),
+        h("p", { class: "note" }, "今の作業フォルダ: ", h("span", { class: "path" }, STATE.workspace_root || "(見つかりません)"))),
       h("div", {},
-        switchRow("tools_write", "ファイルの変更を許可", "作業フォルダの中のファイルを作成・編集・移動・削除できるようにします。元の内容はバックアップに残り、元に戻せます。"),
-        switchRow("tools_run", "コマンドと Python の実行を許可", "テストの実行やプログラムの動作確認などのため、コマンドや AI が書いたコードをこの PC で実行します。あなたの権限で動くため、内容を信頼できる用途でだけオンにしてください。"),
-        switchRow("tools_pc", "PC の操作を許可", STATE.pc_supported ? "アプリを開く、文字を入力する、クリックする、画面を見るなどの操作をできるようにします。入力の前に送り先のウィンドウを確かめます。" : "この PC では使えません。"),
-        switchRow("tools_net", "ネットの利用を許可", "Wikipedia で調べたり、指定されたウェブページを読んだりできるようにします。事実の質問で回答に自信がないときも、Wikipedia で確かめてから答えます(出典を表示します)。"),
-        switchRow("tools_confirm", "影響のある操作の前に確認する", "ファイルの変更・コマンドの実行・PC の操作の前に、内容を見せて許可を求めます(スマホからも許可できます)。オフにすると確認せずに実行します。"))),
+        full ? h("p", { class: "note warn" }, "権限が「すべて許可」のため、下の道具はすべて使えます(切り替えは、ほかのモードのときに効きます)。") : null,
+        switchRow("tools_write", "ファイルの変更", "ファイルの作成・編集・移動・削除。元の内容はバックアップに残り、元に戻せます。"),
+        switchRow("tools_run", "コマンドと Python の実行", "テスト・ビルド・スクリプトの実行や、サーバーの起動など。あなたの権限で動きます。"),
+        switchRow("tools_pc", "PC の操作", STATE.pc_supported ? "アプリを開く、文字を入力する、クリックする、画面を見るなど。入力の前に送り先のウィンドウを確かめます。" : "この PC では使えません。"),
+        switchRow("tools_net", "ネットの利用", "Wikipedia・ウェブページ・ニュース、パッケージの取り込み(pip / npm など)。事実の質問で自信がないときも、Wikipedia で確かめてから答えます。"),
+        h("div", { class: "setting" }, h("b", {}, "エージェントのAI"), h("p", {}, "手順を進めるAIです。自動では、計測の正確さと、この PC での速さで選びます。"), h("div", { class: "ctl" }, agentModel)),
+        h("div", { class: "setting" }, h("b", {}, "手数の上限"), h("p", {}, "1つの依頼で道具を使える回数の上限です(5〜200)。"), h("div", { class: "ctl" }, maxSteps))),
+      processesPanel()),
     h("div", { class: "panel" }, h("h2", {}, "スマホ連携"),
       h("div", {},
         switchRow("remote_enabled", "スマホからの接続を受け付ける", "Tailscale のアドレスで、登録したスマホからの接続を受け付けます。登録していない端末は使えません。"),
@@ -1064,9 +1481,13 @@ async function loadPhone() {
   let apkPanel = null;
   await loadState().catch(() => {});
   if (STATE.apk) {
+    const info = STATE.apk_info || {};
+    const version = info.version ? `版 ${info.version}(build ${info.build})・${Math.round((info.size || 0) / 1e6)}MB` : "";
     apkPanel = h("div", { class: "panel" }, h("h2", {}, "スマホ用アプリ", h("small", {}, "Android")),
+      version ? h("p", {}, version) : null,
       h("p", { class: "note" }, "スマホで次のアドレスを開くと、アプリをダウンロードできます(提供元不明のアプリのインストールを許可する必要があります)。"),
-      apkUrl ? h("code", {}, apkUrl) : h("p", { class: "note" }, "Tailscale がつながるとアドレスが表示されます。"));
+      apkUrl ? h("code", {}, apkUrl) : h("p", { class: "note" }, "Tailscale がつながるとアドレスが表示されます。"),
+      h("p", { class: "note" }, "入れたあとは、スマホのアプリの「設定 → このアプリについて → 更新する」で、ここにある新しい版に入れ替えられます(新しい版は celestial publish-app で置きます)。"));
   }
 
   const deviceRows = dev.devices.map((d) => {
@@ -1117,10 +1538,263 @@ async function loadPhone() {
 }
 
 // ---- 起動 ----
+// ---- 見る(カメラ・画面・画像の認識) ----
+const VISION = { src: "camera", mode: "describe", stream: null, busy: false, live: false, timer: null, image: null, result: null,
+  modes: [], watchPrev: null, lastWatch: 0 };
+const VISION_HINT = {
+  camera: "「カメラを開始」を押すと、この PC のカメラの映像が出ます。",
+  screen: "「読み取る」を押すと、今の PC の画面を読み取ります。",
+  image: "画像を選ぶか、ここに貼り付け・ドラッグしてください。",
+};
+
+async function loadVision() {
+  if (!VISION.modes.length) {
+    const data = await api("/api/vision/modes");
+    VISION.modes = data.modes;
+    if (!data.available) toast("画像を扱えるAIがありません(例: ollama pull gemma3:4b)");
+    renderVisionModes();
+  }
+  renderVisionSource();
+  if (VISION.src === "camera") await listCameras();
+}
+
+function renderVisionModes() {
+  const box = $("vision-modes");
+  box.replaceChildren(...VISION.modes.map((m) => h("button", { type: "button", class: "chip", role: "radio", "aria-pressed": String(m.id === VISION.mode),
+    "aria-checked": String(m.id === VISION.mode), onclick: () => { VISION.mode = m.id; renderVisionModes(); } }, m.label)));
+  const mode = VISION.modes.find((m) => m.id === VISION.mode);
+  $("vision-question").hidden = !(mode && mode.question);
+  try { localStorage.setItem("celestial-vision-mode", VISION.mode); } catch {}
+}
+
+function renderVisionSource() {
+  for (const b of $("vision-sources").children) b.setAttribute("aria-selected", String(b.dataset.src === VISION.src));
+  const camera = VISION.src === "camera";
+  $("vision-camera-pick").hidden = !camera;
+  $("vision-toggle").hidden = !camera;
+  $("vision-pick").hidden = VISION.src !== "image";
+  $("vision-live-pick").hidden = $("vision-interval").hidden = VISION.src === "image";
+  $("vision-video").hidden = !(camera && VISION.stream);
+  $("vision-still").hidden = camera || !VISION.image;
+  $("vision-empty").hidden = (camera && VISION.stream) || (!camera && VISION.image);
+  $("vision-empty").textContent = VISION_HINT[VISION.src];
+  $("vision-toggle").textContent = VISION.stream ? "カメラを止める" : "カメラを開始";
+}
+
+async function listCameras() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.enumerateDevices) return;
+  const devices = (await navigator.mediaDevices.enumerateDevices()).filter((d) => d.kind === "videoinput");
+  const select = $("vision-camera"), keep = select.value;
+  select.replaceChildren(...devices.map((d, i) => h("option", { value: d.deviceId }, d.label || `カメラ ${i + 1}`)));
+  if (keep && devices.some((d) => d.deviceId === keep)) select.value = keep;
+}
+
+async function startCamera() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) { toast("このブラウザーではカメラを使えません"); return; }
+  stopCamera();
+  const id = $("vision-camera").value;
+  try {
+    VISION.stream = await navigator.mediaDevices.getUserMedia({ video: { deviceId: id ? { exact: id } : undefined, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
+  } catch (e) { toast("カメラを開けませんでした: " + (e.message || e.name)); return; }
+  const video = $("vision-video");
+  video.srcObject = VISION.stream;
+  await video.play().catch(() => {});
+  await listCameras();
+  renderVisionSource();
+  if (VISION.live) scheduleVision(0);
+}
+
+function stopCamera() {
+  if (VISION.stream) VISION.stream.getTracks().forEach((t) => t.stop());
+  VISION.stream = null;
+  $("vision-video").srcObject = null;
+  renderVisionSource();
+}
+
+function visionLeave() {
+  setLive(false);
+  stopCamera();
+}
+
+// 送る画像は長い辺 960px までの JPEG(AIの読み取りが速く、文字も読める大きさ)
+function frameToJpeg(source, width, height, max = 960) {
+  const scale = Math.min(1, max / Math.max(width, height));
+  const canvas = document.createElement("canvas");
+  canvas.width = Math.round(width * scale); canvas.height = Math.round(height * scale);
+  canvas.getContext("2d").drawImage(source, 0, 0, canvas.width, canvas.height);
+  return canvas.toDataURL("image/jpeg", 0.85);
+}
+
+function cameraFrame() {
+  const video = $("vision-video");
+  if (!VISION.stream || !video.videoWidth) return null;
+  return frameToJpeg(video, video.videoWidth, video.videoHeight);
+}
+
+// 見張り: 小さく縮めた白黒の映像を前と比べ、動きがあったときだけAIに読ませる
+function motionScore() {
+  const video = $("vision-video");
+  if (!video.videoWidth) return 0;
+  const c = document.createElement("canvas"); c.width = 64; c.height = 36;
+  const g = c.getContext("2d", { willReadFrequently: true });
+  g.drawImage(video, 0, 0, 64, 36);
+  const px = g.getImageData(0, 0, 64, 36).data, gray = new Float32Array(64 * 36);
+  for (let i = 0; i < gray.length; i++) gray[i] = px[i * 4] * 0.3 + px[i * 4 + 1] * 0.59 + px[i * 4 + 2] * 0.11;
+  const prev = VISION.watchPrev; VISION.watchPrev = gray;
+  if (!prev) return 0;
+  let changed = 0;
+  for (let i = 0; i < gray.length; i++) if (Math.abs(gray[i] - prev[i]) > 28) changed++;
+  return changed / gray.length;
+}
+
+async function analyzeVision({ auto = false } = {}) {
+  if (VISION.busy) return;
+  const mode = VISION.modes.find((m) => m.id === VISION.mode) || { id: VISION.mode, label: VISION.mode };
+  const question = $("vision-question").value.trim();
+  if (mode.question && !question) { if (!auto) toast("質問を入力してください"); return; }
+  let body;
+  if (VISION.src === "camera") {
+    const frame = cameraFrame();
+    if (!frame) { if (!auto) toast("先に「カメラを開始」を押してください"); return; }
+    VISION.image = frame;
+    body = { image: frame, mode: mode.id, question };
+  } else if (VISION.src === "screen") {
+    body = { source: "screen", return_image: true, mode: mode.id, question };
+  } else {
+    if (!VISION.image) { if (!auto) toast("画像を選んでください"); return; }
+    body = { image: VISION.image, mode: mode.id, question };
+  }
+  VISION.busy = true;
+  $("vision-shot").disabled = true;
+  $("vision-scan").hidden = false;
+  if (!auto) $("vision-meta").textContent = "読み取り中…";
+  try {
+    const r = await api("/api/vision", body);
+    if (r.image) { VISION.image = "data:image/jpeg;base64," + r.image; $("vision-still").src = VISION.image; renderVisionSource(); }
+    showVisionResult(r, mode);
+    if (auto || VISION.mode === "watch") logVision(r, mode);
+  } catch (e) {
+    $("vision-meta").textContent = "";
+    toast(e.message);
+    if (auto) setLive(false);
+  } finally {
+    VISION.busy = false;
+    $("vision-shot").disabled = false;
+    $("vision-scan").hidden = true;
+  }
+}
+
+function showVisionResult(r, mode) {
+  VISION.result = r;
+  $("vision-meta").textContent = `${mode.label}・${r.model}・${secs(r.latency_s)}`;
+  renderMarkdown($("vision-result"), r.text || "(結果なし)");
+  $("vision-objects").replaceChildren(...(r.objects || []).map((o) => h("span", { class: "vision-count" }, h("b", {}, String(o.count)), o.name)));
+  $("vision-copy").disabled = $("vision-chat").disabled = false;
+  if ($("vision-speak").checked && window.speechSynthesis && r.text) {
+    speechSynthesis.cancel();
+    const u = new SpeechSynthesisUtterance(r.text.replace(/[#*`|>-]/g, " ").slice(0, 600));
+    u.lang = "ja-JP";
+    speechSynthesis.speak(u);
+  }
+}
+
+function logVision(r, mode) {
+  if (mode.id === "watch" && /特に変化なし/.test(r.text || "")) return;
+  const thumb = VISION.image ? h("img", { src: VISION.image, alt: "" }) : null;
+  const item = h("li", {}, thumb, h("div", {}, h("div", { class: "vision-log-head" }, h("b", {}, new Date().toLocaleTimeString("ja-JP")), h("span", { class: "tag" }, mode.label)),
+    h("p", {}, (r.text || "").split("\n")[0].slice(0, 200))));
+  const list = $("vision-log");
+  list.prepend(item);
+  while (list.children.length > 30) list.lastChild.remove();
+}
+
+function scheduleVision(delay) {
+  clearTimeout(VISION.timer);
+  if (!VISION.live) return;
+  VISION.timer = setTimeout(async () => {
+    if (!VISION.live) return;
+    if (VISION.mode === "watch" && VISION.src === "camera") {
+      const moved = motionScore();
+      const quiet = Date.now() - VISION.lastWatch > 60000;  // 動きがなくても、1分に1回は様子を見る
+      if (moved > 0.04 || quiet) { VISION.lastWatch = Date.now(); await analyzeVision({ auto: true }); }
+      scheduleVision(700);
+      return;
+    }
+    await analyzeVision({ auto: true });
+    scheduleVision(Number($("vision-interval").value) * 1000);
+  }, delay);
+}
+
+function setLive(on) {
+  VISION.live = on;
+  $("vision-live").checked = on;
+  $("vision-badge").hidden = !on;
+  VISION.watchPrev = null;
+  if (on) scheduleVision(0); else clearTimeout(VISION.timer);
+}
+
+function setVisionImage(file) {
+  if (!file || !file.type.startsWith("image/")) return;
+  const url = URL.createObjectURL(file), img = new Image();
+  img.onload = () => {
+    VISION.image = frameToJpeg(img, img.naturalWidth, img.naturalHeight, 1280);
+    URL.revokeObjectURL(url);
+    $("vision-still").src = VISION.image;
+    renderVisionSource();
+  };
+  img.src = url;
+}
+
+$("vision-sources").addEventListener("click", (e) => {
+  const b = e.target.closest("button");
+  if (!b || b.dataset.src === VISION.src) return;
+  setLive(false);
+  if (VISION.src === "camera") stopCamera();
+  VISION.src = b.dataset.src;
+  VISION.image = null;
+  renderVisionSource();
+  if (VISION.src === "camera") listCameras();
+});
+$("vision-toggle").addEventListener("click", () => (VISION.stream ? stopCamera() : startCamera()));
+$("vision-camera").addEventListener("change", () => { if (VISION.stream) startCamera(); });
+$("vision-shot").addEventListener("click", () => analyzeVision());
+$("vision-live").addEventListener("change", (e) => {
+  if (e.target.checked && VISION.src === "camera" && !VISION.stream) startCamera().then(() => setLive(Boolean(VISION.stream)));
+  else setLive(e.target.checked);
+});
+$("vision-interval").addEventListener("change", () => { if (VISION.live) scheduleVision(0); });
+$("vision-pick").addEventListener("click", () => $("vision-file").click());
+$("vision-file").addEventListener("change", (e) => { setVisionImage(e.target.files[0]); e.target.value = ""; });
+$("vision-frame").addEventListener("dragover", (e) => { e.preventDefault(); });
+$("vision-frame").addEventListener("drop", (e) => {
+  e.preventDefault();
+  const file = [...(e.dataTransfer.files || [])].find((f) => f.type.startsWith("image/"));
+  if (file) { if (VISION.src !== "image") { setLive(false); stopCamera(); VISION.src = "image"; } setVisionImage(file); }
+});
+document.addEventListener("paste", (e) => {
+  if (currentView !== "vision") return;
+  const file = [...(e.clipboardData && e.clipboardData.files || [])].find((f) => f.type.startsWith("image/"));
+  if (file) { e.preventDefault(); if (VISION.src !== "image") { setLive(false); stopCamera(); VISION.src = "image"; } setVisionImage(file); }
+});
+$("vision-question").addEventListener("keydown", (e) => { if (e.key === "Enter") analyzeVision(); });
+$("vision-copy").addEventListener("click", (e) => copy((VISION.result && VISION.result.text) || "", e.target));
+$("vision-chat").addEventListener("click", () => {
+  if (!VISION.image) return;
+  attachments.push({ kind: "image", name: "vision.jpg", data: VISION.image.split(",")[1], url: VISION.image });
+  renderAttachments();
+  show("chat");
+  const task = $("task");
+  if (!task.value.trim()) task.value = "この画像について、";
+  grow();
+  task.focus();
+});
+try { VISION.mode = localStorage.getItem("celestial-vision-mode") || "describe"; } catch {}
+
 async function boot() {
   try { await loadState(); } catch (e) {
     $("status").className = "status ng";
     $("status").lastElementChild.textContent = "接続できません";
+    $("status").title = "接続できません\n" + e.message;
     toast(e.message);
   }
   await loadThreads().catch((e) => toast(e.message));

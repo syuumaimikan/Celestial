@@ -41,7 +41,19 @@ CREATE TABLE IF NOT EXISTS study (
     task_hash TEXT NOT NULL UNIQUE,
     role TEXT NOT NULL,
     model TEXT NOT NULL,             -- 手本の回答を書いたモデル(教師)
-    answer TEXT NOT NULL
+    answer TEXT NOT NULL,
+    verified INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS preferences (
+    id INTEGER PRIMARY KEY,
+    ts REAL NOT NULL,
+    task TEXT NOT NULL,
+    task_hash TEXT NOT NULL,
+    role TEXT NOT NULL,
+    chosen TEXT NOT NULL,
+    rejected TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'study',
+    UNIQUE(task_hash, chosen, rejected)
 );
 CREATE TABLE IF NOT EXISTS embeddings (
     task_hash TEXT NOT NULL,
@@ -74,6 +86,26 @@ CREATE TABLE IF NOT EXISTS bench_items (  -- 計測の問題ごとの結果。�
     escalated INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (run_id, task_id)
 );
+CREATE TABLE IF NOT EXISTS kb_docs (
+    id INTEGER PRIMARY KEY,
+    source TEXT NOT NULL UNIQUE,     -- ファイルパス・URL・note:<title>
+    title TEXT NOT NULL,
+    kind TEXT NOT NULL,              -- file / url / note
+    tags TEXT NOT NULL DEFAULT '',
+    content_hash TEXT NOT NULL,
+    chars INTEGER NOT NULL DEFAULT 0,
+    chunks INTEGER NOT NULL DEFAULT 0,
+    updated REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS kb_chunks (
+    id INTEGER PRIMARY KEY,
+    doc_id INTEGER NOT NULL REFERENCES kb_docs(id) ON DELETE CASCADE,
+    idx INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    text_hash TEXT NOT NULL,
+    UNIQUE(doc_id, idx)
+);
+CREATE INDEX IF NOT EXISTS idx_kb_chunks_doc ON kb_chunks(doc_id);
 """
 
 
@@ -98,9 +130,13 @@ class Store:
             Path(path).parent.mkdir(parents=True, exist_ok=True)
         self._db = sqlite3.connect(str(path), check_same_thread=False)
         self._db.row_factory = sqlite3.Row
+        self._db.execute("PRAGMA foreign_keys = ON")
         self._lock = threading.Lock()
         with self._lock:
             self._db.executescript(_SCHEMA)
+            cols = {r[1] for r in self._db.execute("PRAGMA table_info(study)").fetchall()}
+            if "verified" not in cols:
+                self._db.execute("ALTER TABLE study ADD COLUMN verified INTEGER NOT NULL DEFAULT 0")
 
     def _query(self, sql: str, args: tuple = ()) -> list[sqlite3.Row]:
         with self._lock:
@@ -234,20 +270,79 @@ class Store:
             self._db.execute("INSERT INTO settings (key, value) VALUES (?, ?)"
                              " ON CONFLICT(key) DO UPDATE SET value = excluded.value", (key, json.dumps(value)))
 
-    def add_study(self, *, task: str, role: str, model: str, answer: str) -> bool:
+    def add_study(self, *, task: str, role: str, model: str, answer: str, verified: bool = False) -> bool:
         """自習の成果を1件保存する。同じ問題が既にあれば False。"""
         with self._lock, self._db:
             cur = self._db.execute(
-                "INSERT OR IGNORE INTO study (ts, task, task_hash, role, model, answer) VALUES (?,?,?,?,?,?)",
-                (time.time(), task, task_hash(task), role, model, answer))
+                "INSERT OR IGNORE INTO study (ts, task, task_hash, role, model, answer, verified) VALUES (?,?,?,?,?,?,?)",
+                (time.time(), task, task_hash(task), role, model, answer, int(bool(verified))))
             return cur.rowcount == 1
 
     def delete_study(self, task: str) -> None:
         with self._lock, self._db:
             self._db.execute("DELETE FROM study WHERE task_hash = ?", (task_hash(task),))
 
+    def update_study_answer(self, task: str, answer: str, *, verified: bool | None = None) -> None:
+        with self._lock, self._db:
+            if verified is None:
+                self._db.execute("UPDATE study SET answer = ? WHERE task_hash = ?", (answer, task_hash(task)))
+            else:
+                self._db.execute("UPDATE study SET answer = ?, verified = ? WHERE task_hash = ?",
+                                 (answer, int(bool(verified)), task_hash(task)))
+
     def study_rows(self) -> list[sqlite3.Row]:
-        return self._query("SELECT task, role, model, answer FROM study ORDER BY id")
+        return self._query("SELECT task, role, model, answer, verified FROM study ORDER BY id")
+
+    def study_counts_by_role(self) -> dict[str, int]:
+        rows = self._query("SELECT role, COUNT(*) AS n FROM study GROUP BY role")
+        return {r["role"]: int(r["n"]) for r in rows}
+
+    def add_preference(self, *, task: str, role: str, chosen: str, rejected: str, source: str = "study") -> bool:
+        """良否の比較ペア(DPO/ORPO学習用)を保存する。"""
+        chosen_s, rejected_s = chosen.strip(), rejected.strip()
+        if not chosen_s or not rejected_s or chosen_s == rejected_s:
+            return False
+        with self._lock, self._db:
+            cur = self._db.execute(
+                "INSERT OR IGNORE INTO preferences (ts, task, task_hash, role, chosen, rejected, source)"
+                " VALUES (?,?,?,?,?,?,?)",
+                (time.time(), task, task_hash(task), role, chosen_s, rejected_s, source),
+            )
+            return cur.rowcount == 1
+
+    def preference_rows(self, role: str | None = None) -> list[sqlite3.Row]:
+        if role is not None:
+            return self._query("SELECT task, role, chosen, rejected, source FROM preferences WHERE role = ? ORDER BY id", (role,))
+        return self._query("SELECT task, role, chosen, rejected, source FROM preferences ORDER BY id")
+
+    def interaction_preferences(self) -> list[dict]:
+        """悪評価・却下された回答と、同じ依頼の良回答・自習の手本をペアにして返す。"""
+        bads = self._query(
+            "SELECT task, task_hash, role, answer FROM interactions"
+            " WHERE (feedback = -1 OR verified = -1 OR source = 'rejected') AND answer != ''"
+            " ORDER BY id DESC"
+        )
+        if not bads:
+            return []
+        good_map: dict[str, tuple[str, str]] = {}
+        for r in self._query("SELECT task_hash, role, answer FROM study"):
+            good_map[r["task_hash"]] = (r["role"], r["answer"])
+        for r in self._query(
+            "SELECT task_hash, role, answer FROM interactions"
+            " WHERE source = 'llm' AND (feedback = 1 OR (verified = 1 AND feedback IS NULL)) ORDER BY id"
+        ):
+            good_map[r["task_hash"]] = (r["role"], r["answer"])
+        pairs, seen = [], set()
+        for b in bads:
+            good = good_map.get(b["task_hash"])
+            if not good or good[1].strip() == b["answer"].strip():
+                continue
+            key = (b["task_hash"], good[1], b["answer"])
+            if key in seen:
+                continue
+            seen.add(key)
+            pairs.append({"task": b["task"], "role": good[0] or b["role"], "chosen": good[1], "rejected": b["answer"], "source": "feedback"})
+        return pairs
 
     def bench_priors(self, suites: set[str] | None = None) -> dict[str, dict[str, tuple[float, float, int]]]:
         """{モデル名: {役割: (正解率, 平均秒, 課題数)}}。モデルを固定した計測のうち、それぞれ最新のものを使う。
@@ -256,7 +351,7 @@ class Store:
         難しい新しい課題集で測ったモデルより良く見えてしまう)。suites(今の課題集の識別子)を渡すと、
         それで測った結果があればそれだけを使う。
         """
-        rows = self._query("SELECT label, suite, by_role, avg_latency_s FROM bench_runs ORDER BY id")
+        rows = self._query("SELECT label, suite, by_role, avg_latency_s FROM bench_runs WHERE label NOT LIKE 'agent:%' ORDER BY id")
         if suites and any(r["suite"] in suites for r in rows):
             rows = [r for r in rows if r["suite"] in suites]
         priors: dict[str, dict[str, tuple[float, float, int]]] = {}
@@ -287,6 +382,25 @@ class Store:
                   float(i.get("latency_s") or 0.0), int(bool(i.get("escalated")))) for i in items or []])
             return run_id
 
+    def agent_priors(self, min_tasks: int = 4, recent: int = 3) -> dict[str, tuple[float, float, int]]:
+        """エージェントの計測 {モデル名: (成功率, 1課題の平均秒, 課題数)}。
+
+        モデルごとに、最新の課題集での直近 recent 回を合わせたもの(課題の少ない試しの計測は除く)。小さいモデルは
+        1回ごとのぶれが大きく(同じ版で 4/9 〜 9/9 があった)、たまたまよかった1回だけで選び直さないため。
+        """
+        rows = self._query("SELECT label, suite, n, correct, avg_latency_s FROM bench_runs WHERE label LIKE 'agent:%'"
+                           " AND n >= ? ORDER BY id DESC", (min_tasks,))
+        runs: dict[str, list[sqlite3.Row]] = {}
+        for r in rows:  # 新しい順
+            mine = runs.setdefault(r["label"][len("agent:"):], [])
+            if len(mine) < recent and (not mine or r["suite"] == mine[0]["suite"]):  # 前の課題集の結果は混ぜない
+                mine.append(r)
+        priors = {}
+        for name, mine in runs.items():
+            n = sum(r["n"] for r in mine)
+            priors[name] = (sum(r["correct"] for r in mine) / n, sum(r["avg_latency_s"] * r["n"] for r in mine) / n, n)
+        return priors
+
     def bench_version(self) -> int:
         """計測の記録が増えるたびに変わる値(学んだ境目の作り直しの合図)。"""
         return int(self._query("SELECT COALESCE(MAX(id), 0) AS v FROM bench_runs")[0]["v"])
@@ -308,3 +422,65 @@ class Store:
             "SELECT task, role, model, answer, feedback, verified FROM interactions"
             " WHERE source = 'llm' AND (feedback IS NULL OR feedback = 1) AND verified != -1 ORDER BY id"
         )
+
+    # ---- ナレッジベース(RAG) ------------------------------------------------
+
+    def kb_upsert_doc(self, *, source: str, title: str, kind: str, tags: str, content_hash: str,
+                      chars: int, chunks: list[str]) -> tuple[int, bool]:
+        """文書とチャンクを登録または更新する。同じ content_hash なら更新をスキップし (doc_id, False) を返す。"""
+        now = time.time()
+        with self._lock, self._db:
+            existing = self._db.execute("SELECT id, content_hash FROM kb_docs WHERE source = ?", (source,)).fetchone()
+            if existing and existing["content_hash"] == content_hash and existing["id"]:
+                self._db.execute("UPDATE kb_docs SET title = ?, tags = ?, updated = ? WHERE id = ?",
+                                 (title, tags, now, existing["id"]))
+                return int(existing["id"]), False
+            if existing:
+                doc_id = int(existing["id"])
+                self._db.execute("DELETE FROM kb_chunks WHERE doc_id = ?", (doc_id,))
+                self._db.execute(
+                    "UPDATE kb_docs SET title=?, kind=?, tags=?, content_hash=?, chars=?, chunks=?, updated=? WHERE id=?",
+                    (title, kind, tags, content_hash, chars, len(chunks), now, doc_id),
+                )
+            else:
+                cur = self._db.execute(
+                    "INSERT INTO kb_docs (source, title, kind, tags, content_hash, chars, chunks, updated)"
+                    " VALUES (?,?,?,?,?,?,?,?)",
+                    (source, title, kind, tags, content_hash, chars, len(chunks), now),
+                )
+                doc_id = int(cur.lastrowid)
+            self._db.executemany(
+                "INSERT INTO kb_chunks (doc_id, idx, text, text_hash) VALUES (?,?,?,?)",
+                [(doc_id, idx, txt, task_hash(txt)) for idx, txt in enumerate(chunks)],
+            )
+            return doc_id, True
+
+    def kb_docs(self) -> list[sqlite3.Row]:
+        return self._query("SELECT * FROM kb_docs ORDER BY updated DESC, id DESC")
+
+    def kb_get_doc(self, doc_id_or_source: int | str) -> sqlite3.Row | None:
+        if isinstance(doc_id_or_source, int) or str(doc_id_or_source).isdigit():
+            rows = self._query("SELECT * FROM kb_docs WHERE id = ?", (int(doc_id_or_source),))
+        else:
+            rows = self._query("SELECT * FROM kb_docs WHERE source = ?", (str(doc_id_or_source),))
+        return rows[0] if rows else None
+
+    def kb_delete_doc(self, doc_id_or_source: int | str) -> bool:
+        doc = self.kb_get_doc(doc_id_or_source)
+        if doc is None:
+            return False
+        with self._lock, self._db:
+            self._db.execute("DELETE FROM kb_chunks WHERE doc_id = ?", (doc["id"],))
+            deleted = self._db.execute("DELETE FROM kb_docs WHERE id = ?", (doc["id"],)).rowcount
+            return bool(deleted)
+
+    def kb_chunks(self) -> list[sqlite3.Row]:
+        return self._query(
+            "SELECT c.id, c.doc_id, c.idx, c.text, c.text_hash, d.source, d.title, d.kind, d.tags"
+            " FROM kb_chunks c JOIN kb_docs d ON c.doc_id = d.id ORDER BY c.id"
+        )
+
+    def kb_stats(self) -> dict[str, int]:
+        row = self._query("SELECT COUNT(*) AS docs, COALESCE(SUM(chunks), 0) AS chunks, COALESCE(SUM(chars), 0) AS chars FROM kb_docs")[0]
+        emb = self._query("SELECT COUNT(DISTINCT c.id) AS n FROM kb_chunks c JOIN embeddings e ON c.text_hash = e.task_hash")[0]
+        return {"docs": int(row["docs"]), "chunks": int(row["chunks"]), "chars": int(row["chars"]), "embedded": int(emb["n"])}
